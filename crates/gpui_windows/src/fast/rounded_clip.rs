@@ -2,7 +2,7 @@
 //! directly in the colour shader. Each child appends its geometry and restores
 //! the enclosing stack afterward; no mask render targets or passes are needed.
 
-use std::{path::PathBuf, slice};
+use std::slice;
 
 use anyhow::{Context as _, Result};
 use gpui::{AtlasTextureId, LayerFrame, Scene};
@@ -22,12 +22,16 @@ use crate::directx_renderer::{
 };
 use crate::fast::frame::{FrameState, PathTargets, Target, draw_scene_masked, upload};
 
-pub(crate) fn shader_path(original: PathBuf, out_dir: &str) -> PathBuf {
+/// [PiCell] Only the runtime shader compiler (`build_shader_blob`, debug builds) asks for this;
+/// release builds link the shaders `build.rs` precompiled, so without the cfg every release build
+/// warned that it is never used.
+#[cfg(debug_assertions)]
+pub(crate) fn shader_path(original: std::path::PathBuf, out_dir: &str) -> std::path::PathBuf {
     if original
         .file_name()
         .is_some_and(|name| name == "shaders.hlsl")
     {
-        PathBuf::from(out_dir).join("rounded_clip_shaders.hlsl")
+        std::path::PathBuf::from(out_dir).join("rounded_clip_shaders.hlsl")
     } else {
         original
     }
