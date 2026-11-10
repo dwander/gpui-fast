@@ -4121,6 +4121,7 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
         crate::fast::stats::FramePhaseTimes::end_paint(&mut self.fast_layout.phase_times);
+        crate::fast::stats::picell_log(self);
 
         #[cfg(feature = "profiler")]
         self.window_profiler

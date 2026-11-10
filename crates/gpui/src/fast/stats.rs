@@ -304,3 +304,47 @@ impl Window {
         lines
     }
 }
+
+/// [PiCell] 트라이얼 진단 — `PICELL_FAST_STATS=1` 이면 1초마다 그 사이 그린 프레임의 작업량
+/// (뷰 재빌드·재사용, 스크롤 레이어, 단계별 시간)을 `log::info!` 로 남기고 카운터를 비운다.
+/// 테스트 빌드 밖에서는 `Window::layout_stats` 가 없어 앱에서 Retained Mode 효과를 볼 길이 없다.
+pub(crate) fn picell_log(window: &mut Window) {
+    use std::cell::Cell;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("PICELL_FAST_STATS").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    thread_local! {
+        static WINDOW_START: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        static FRAMES: Cell<u64> = const { Cell::new(0) };
+    }
+    FRAMES.set(FRAMES.get() + 1);
+    let now = std::time::Instant::now();
+    let start = WINDOW_START.get().unwrap_or(now);
+    WINDOW_START.set(Some(start));
+    if now.duration_since(start) < Duration::from_secs(1) {
+        return;
+    }
+    WINDOW_START.set(Some(now));
+    let frames = FRAMES.replace(0);
+    let Some(engine) = window.layout_engine.as_mut() else {
+        return;
+    };
+    let stats = std::mem::take(&mut engine.retention.stats);
+    let phases = &mut window.fast_layout.phase_times;
+    let (build, prepaint, paint) = (phases.build, phases.prepaint, phases.paint);
+    phases.build = Duration::ZERO;
+    phases.prepaint = Duration::ZERO;
+    phases.paint = Duration::ZERO;
+    log::info!(
+        "[fast-stats] frames={frames} views built={} reused={} | layers composited={} repainted={} demoted={} | build={:.2}ms prepaint={:.2}ms paint={:.2}ms (per frame)",
+        stats.views_built,
+        stats.views_reused,
+        stats.layer_frames_composited,
+        stats.layer_frames_repainted,
+        stats.layers_demoted,
+        build.as_secs_f64() * 1000.0 / frames as f64,
+        prepaint.as_secs_f64() * 1000.0 / frames as f64,
+        paint.as_secs_f64() * 1000.0 / frames as f64,
+    );
+}
