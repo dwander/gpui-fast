@@ -65,6 +65,8 @@ pub(crate) fn draw_tiles(
                     SpriteInputIndex::Sprites as usize,
                 );
             }
+            // [PiCell] Our HDR sprite parameters: a tile is already-rasterized SDR content.
+            renderer.set_hdr_params(command_encoder, false);
         }
         let texture_size = size(
             DevicePixels(texture.width() as i32),

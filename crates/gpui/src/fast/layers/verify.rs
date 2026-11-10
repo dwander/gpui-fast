@@ -65,6 +65,10 @@ fn clip_to(primitive: &mut Primitive, mask: &Bounds<ScaledPixels>) {
         Primitive::SubpixelSprite(p) => &mut p.content_mask,
         Primitive::PolychromeSprite(p) => &mut p.content_mask,
         Primitive::Surface(p) => &mut p.content_mask,
+        // [PiCell] Our blur primitives. A scroll layer never holds one (`layers::paint` draws
+        // filtered content straight into the frame), but the match must name them.
+        Primitive::BackdropFilter(p) => &mut p.content_mask,
+        Primitive::FilterBoundary(p) => &mut p.content_mask,
     };
     content_mask.bounds = content_mask.bounds.intersect(mask);
 }
@@ -225,6 +229,22 @@ fn describe(primitive: &Primitive) -> String {
             }
         ),
         Primitive::Surface(p) => format!("surface {:?} {:?}", p.bounds, p.content_mask),
+        // [PiCell] Our blur primitives — see `clip_to`.
+        Primitive::BackdropFilter(p) => format!(
+            "backdrop filter {:?} {:?} {:?} {:?} {}",
+            p.bounds, p.content_mask, p.corner_radii, p.filters, p.opacity
+        ),
+        Primitive::FilterBoundary(p) => format!(
+            "filter boundary {} {:?} {:?} {:?} {:?} {} {} {:?}",
+            p.is_start,
+            p.bounds,
+            p.content_mask,
+            p.corner_radii,
+            p.filters,
+            p.opacity,
+            p.scale,
+            p.scale_anchor
+        ),
     }
 }
 

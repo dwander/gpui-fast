@@ -36,7 +36,11 @@ use crate::metal_renderer::{
 };
 
 /// The pixel format of tiles: the drawable's and every pipeline's.
-const TILE_FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
+///
+/// [PiCell] Upstream's `BGRA8Unorm` was the drawable's format; our HDR drawable and pipelines are
+/// half float, and a tile in any other format than the pipelines' draws garbage (Metal API
+/// validation: "the render pipeline's pixelFormat does not match the framebuffer's").
+const TILE_FORMAT: MTLPixelFormat = crate::metal_renderer::RENDER_TARGET_FORMAT;
 
 /// Forwarded to by `MetalRenderer::render_frame` before it encodes `scene`:
 /// rasterizes the layer tiles `scene` needs that the cache lacks, and notes

@@ -11,6 +11,8 @@ mod fast;
 pub mod keychain;
 mod metal_atlas;
 pub mod metal_renderer;
+// [PiCell] Blur filter targets shared by upstream's batch loop and gpui-fast's rounded clip loop.
+mod picell_filters;
 pub mod process_info;
 
 #[cfg(feature = "font-kit")]

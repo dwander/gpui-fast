@@ -2,9 +2,8 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, FilterBoundary,
-    PaintSurface, Path, Point, PrimitiveBatch, ScaledFilter, ScaledPixels, Scene, Size, point,
-    size,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledFilter, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -39,7 +38,11 @@ use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 /// drawable and can be presented as EDR (see [`MetalRenderer::set_wants_hdr`]). Blending and
 /// the shaders are unchanged: they keep working in the same (non-linear) encoding as the 8-bit
 /// target did, only with more range and precision.
-const RENDER_TARGET_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
+///
+/// Metal bakes the colour attachment's format into every pipeline state, so anything those
+/// pipelines draw into must use it too — gpui-fast's scroll layer tiles included
+/// (`fast::layers::raster`), which upstream sized for an 8-bit drawable.
+pub(crate) const RENDER_TARGET_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
 
 /// The largest blur radius in a scene-space filter chain, in device pixels — used to size the
 /// blur kernel and the dilated region the blur passes are scissored to.
@@ -47,7 +50,7 @@ const RENDER_TARGET_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
 /// The `match` is exhaustive on purpose: adding a [`ScaledFilter`] variant breaks it here,
 /// forcing this backend to handle (or deliberately ignore) the new filter rather than silently
 /// dropping it.
-fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
+pub(crate) fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
     filters.iter().fold(0.0, |acc, filter| match filter {
         ScaledFilter::Blur(radius) => acc.max(radius.0),
     })
@@ -203,17 +206,17 @@ pub struct MetalRenderer {
     blur_composite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
     // passes can sample already-painted content), the half-res ping/pong blur targets, and a
-    // full-res target for content-filter groups.
-    scene_color_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    blur_ping_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    blur_pong_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    // full-res target for content-filter groups. Drawn through by `picell_filters`.
+    pub(crate) scene_color_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    pub(crate) blur_ping_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    pub(crate) blur_pong_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     /// Current EDR headroom the HDR sprite shader compresses into (see [`HdrParams`]).
     hdr_headroom: f32,
     /// Full-resolution offscreen targets a content-filter (`filter`) group renders into before
     /// being blurred and composited back. One per nesting level (indexed by isolation depth) so
     /// nested content blurs isolate correctly, up to [`MAX_FILTER_DEPTH`]; deeper nests render
     /// inline.
-    group_textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+    pub(crate) group_textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -717,19 +720,7 @@ impl MetalRenderer {
 
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
-        let texture_descriptor = MTLTextureDescriptor::new();
-        // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
-        unsafe {
-            texture_descriptor.setWidth(size.width.0 as usize);
-            texture_descriptor.setHeight(size.height.0 as usize);
-        }
-        texture_descriptor.setPixelFormat(RENDER_TARGET_FORMAT);
-        texture_descriptor.setStorageMode(MTLStorageMode::Private);
-        texture_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let intermediate_texture = self
-            .device
-            .newTextureWithDescriptor(&texture_descriptor)
-            .context("allocating path intermediate texture")?;
+        let (intermediate_texture, msaa_texture) = self.new_path_textures(size)?;
 
         // Full-res scene + group targets, and half-res ping/pong blur targets.
         let make_color_texture = |width: usize, height: usize, label: &str| {
@@ -755,6 +746,38 @@ impl MetalRenderer {
         let blur_ping_texture = make_color_texture(full_w / 2, full_h / 2, "blur ping")?;
         let blur_pong_texture = make_color_texture(full_w / 2, full_h / 2, "blur pong")?;
 
+        self.path_intermediate_texture = Some(intermediate_texture);
+        self.path_intermediate_msaa_texture = msaa_texture;
+        self.scene_color_texture = Some(scene_color_texture);
+        self.group_textures = group_textures;
+        self.blur_ping_texture = Some(blur_ping_texture);
+        self.blur_pong_texture = Some(blur_pong_texture);
+        Ok(())
+    }
+
+    /// The path intermediate texture and its multisample twin, sized `size` (positive).
+    #[allow(clippy::type_complexity)]
+    fn new_path_textures(
+        &self,
+        size: Size<DevicePixels>,
+    ) -> Result<(
+        Retained<ProtocolObject<dyn MTLTexture>>,
+        Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    )> {
+        let texture_descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
+        unsafe {
+            texture_descriptor.setWidth(size.width.0 as usize);
+            texture_descriptor.setHeight(size.height.0 as usize);
+        }
+        texture_descriptor.setPixelFormat(RENDER_TARGET_FORMAT);
+        texture_descriptor.setStorageMode(MTLStorageMode::Private);
+        texture_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let intermediate_texture = self
+            .device
+            .newTextureWithDescriptor(&texture_descriptor)
+            .context("allocating path intermediate texture")?;
+
         let msaa_texture = if self.path_sample_count > 1 {
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
             // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
@@ -779,13 +802,27 @@ impl MetalRenderer {
         } else {
             None
         };
-        self.path_intermediate_texture = Some(intermediate_texture);
-        self.path_intermediate_msaa_texture = msaa_texture;
-        self.scene_color_texture = Some(scene_color_texture);
-        self.group_textures = group_textures;
-        self.blur_ping_texture = Some(blur_ping_texture);
-        self.blur_pong_texture = Some(blur_pong_texture);
-        Ok(())
+        Ok((intermediate_texture, msaa_texture))
+    }
+
+    /// [PiCell] Runs `draw` with path textures sized for a scroll layer tile (`size`), then puts
+    /// the frame's back.
+    ///
+    /// Only the path textures: [`Self::update_path_intermediate_textures`] also reallocates the
+    /// blur targets, which a tile would leave tile-sized for the next frame's filters to draw
+    /// through. A tile never holds a filter (`fast::layers` keeps them out of scroll layers).
+    pub(crate) fn with_tile_path_textures<R>(
+        &mut self,
+        size: Size<DevicePixels>,
+        draw: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let (texture, msaa) = self.new_path_textures(size)?;
+        let frame_texture = self.path_intermediate_texture.replace(texture);
+        let frame_msaa = mem::replace(&mut self.path_intermediate_msaa_texture, msaa);
+        let result = draw(self);
+        self.path_intermediate_texture = frame_texture;
+        self.path_intermediate_msaa_texture = frame_msaa;
+        result
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1089,32 +1126,14 @@ impl MetalRenderer {
         crate::fast::dynamic_textures::encode_uploads(&command_buffer);
         let alpha = if self.opaque { 1. } else { 0. };
 
-        // Render the scene into an offscreen color texture (so filters can sample it), then
-        // blit it to `texture`. Owned clones keep the textures borrowable without borrowing
-        // `self` across the batch loop (which calls `&mut self` methods like `draw_surfaces`).
-        // Only route through the offscreen scene texture when the scene actually contains blur
-        // filters; otherwise render straight to `texture` exactly as before (no regression, no
-        // extra blit for the common case).
-        let use_offscreen =
-            !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
-        let scene_color_owned = self.scene_color_texture.clone();
-        let blur_ping_owned = self.blur_ping_texture.clone();
-        let blur_pong_owned = self.blur_pong_texture.clone();
-        let group_owned = self.group_textures.clone();
-        let scene_color: &ProtocolObject<dyn MTLTexture> = if use_offscreen {
-            scene_color_owned.as_deref().unwrap_or(texture)
-        } else {
-            texture
-        };
-        // The active render target; switches to the group texture inside a content-filter group.
-        let mut current_target: &ProtocolObject<dyn MTLTexture> = scene_color;
-        // (boundary, parent target to composite back into, whether this level is isolated).
-        let mut filter_stack: Vec<(FilterBoundary, &ProtocolObject<dyn MTLTexture>, bool)> =
-            Vec::new();
+        // A frame with a filter renders into an offscreen scene (so filters can sample it), then
+        // blits it to `texture`; any other frame renders straight to `texture` (no extra blit
+        // for the common case). Shared with gpui-fast's rounded clip loop: `picell_filters`.
+        let mut filters = crate::picell_filters::FilterTargets::begin(self, scene);
 
         let mut command_encoder = new_command_encoder_for_texture(
             &command_buffer,
-            current_target,
+            crate::picell_filters::target(&filters, texture),
             viewport_size,
             Some(MTLClearColor {
                 red: 0.,
@@ -1145,7 +1164,7 @@ impl MetalRenderer {
 
                     command_encoder = new_command_encoder_for_texture(
                         &command_buffer,
-                        current_target,
+                        crate::picell_filters::target(&filters, texture),
                         viewport_size,
                         None,
                     )?;
@@ -1195,94 +1214,25 @@ impl MetalRenderer {
                     }
                 }
                 PrimitiveBatch::BackdropFilters(range) => {
-                    command_encoder.endEncoding();
-                    if let (Some(ping), Some(pong)) =
-                        (blur_ping_owned.as_deref(), blur_pong_owned.as_deref())
-                    {
-                        for filter in &scene.backdrop_filters[range] {
-                            self.metal_blur_and_composite(
-                                &command_buffer,
-                                current_target,
-                                current_target,
-                                ping,
-                                pong,
-                                viewport_size,
-                                filter.bounds,
-                                filter.content_mask.bounds,
-                                filter.corner_radii,
-                                max_blur_radius(&filter.filters),
-                                filter.opacity,
-                                1.0,
-                                Point::default(),
-                                true,
-                            )?;
-                        }
+                    if let Some(filters) = &filters {
+                        command_encoder = filters.backdrop_filters(
+                            self,
+                            &command_buffer,
+                            command_encoder,
+                            &scene.backdrop_filters[range],
+                            viewport_size,
+                        )?;
                     }
-                    command_encoder = new_command_encoder_for_texture(
-                        &command_buffer,
-                        current_target,
-                        viewport_size,
-                        None,
-                    )?;
                 }
                 PrimitiveBatch::FilterBoundary(ix) => {
-                    let boundary = scene.filter_boundaries[ix].clone();
-                    if boundary.is_start {
-                        // Each isolated nesting level uses its own group texture from the pool
-                        // (indexed by current isolation depth). Beyond the pool size
-                        // (MAX_FILTER_DEPTH) deeper filters render inline without isolation rather
-                        // than corrupting an outer group.
-                        let depth = filter_stack.iter().filter(|entry| entry.2).count();
-                        if depth < group_owned.len() {
-                            command_encoder.endEncoding();
-                            let parent = current_target;
-                            current_target = &group_owned[depth];
-                            filter_stack.push((boundary, parent, true));
-                            command_encoder = new_command_encoder_for_texture(
-                                &command_buffer,
-                                current_target,
-                                viewport_size,
-                                Some(MTLClearColor {
-                                    red: 0.,
-                                    green: 0.,
-                                    blue: 0.,
-                                    alpha: 0.,
-                                }),
-                            )?;
-                        } else {
-                            filter_stack.push((boundary, current_target, false));
-                        }
-                    } else if let Some((boundary, parent, isolated)) = filter_stack.pop() {
-                        if isolated {
-                            command_encoder.endEncoding();
-                            if let (Some(ping), Some(pong)) =
-                                (blur_ping_owned.as_deref(), blur_pong_owned.as_deref())
-                            {
-                                self.metal_blur_and_composite(
-                                    &command_buffer,
-                                    current_target,
-                                    parent,
-                                    ping,
-                                    pong,
-                                    viewport_size,
-                                    boundary.bounds,
-                                    boundary.content_mask.bounds,
-                                    boundary.corner_radii,
-                                    max_blur_radius(&boundary.filters),
-                                    boundary.opacity,
-                                    boundary.scale,
-                                    boundary.scale_anchor,
-                                    false,
-                                )?;
-                            }
-                            current_target = parent;
-                            command_encoder = new_command_encoder_for_texture(
-                                &command_buffer,
-                                current_target,
-                                viewport_size,
-                                None,
-                            )?;
-                        }
+                    if let Some(filters) = &mut filters {
+                        command_encoder = filters.boundary(
+                            self,
+                            &command_buffer,
+                            command_encoder,
+                            &scene.filter_boundaries[ix],
+                            viewport_size,
+                        )?;
                     }
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
@@ -1291,20 +1241,31 @@ impl MetalRenderer {
 
         command_encoder.endEncoding();
 
-        // Present the offscreen scene by copying it into the drawable/target texture.
-        if use_offscreen && scene_color_owned.is_some() {
-            self.run_metal_blur_pass(
-                &command_buffer,
-                &self.blur_downsample_pipeline_state,
-                texture,
-                scene_color,
-                viewport_size,
-                BlurUniform::default(),
-                false,
-            )?;
+        if let Some(filters) = &filters {
+            filters.finish(self, &command_buffer, texture, viewport_size)?;
         }
 
         Ok(command_buffer)
+    }
+
+    /// Copies `source` into `target` 1:1 — how a frame drawn through the offscreen scene is
+    /// presented (`picell_filters::FilterTargets::finish`).
+    pub(crate) fn copy_scene_texture(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        source: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        self.run_metal_blur_pass(
+            command_buffer,
+            &self.blur_downsample_pipeline_state,
+            target,
+            source,
+            viewport_size,
+            BlurUniform::default(),
+            false,
+        )
     }
 
     /// Run a single blur pass: draw a full-screen (or composite) quad sampling `source` into
@@ -1373,7 +1334,7 @@ impl MetalRenderer {
     /// `scale` about `scale_anchor`, and modulated by `opacity`. Shared by the backdrop and
     /// content-filter paths.
     #[allow(clippy::too_many_arguments)]
-    fn metal_blur_and_composite(
+    pub(crate) fn metal_blur_and_composite(
         &self,
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         source: &ProtocolObject<dyn MTLTexture>,
@@ -1931,18 +1892,9 @@ impl MetalRenderer {
                 Some(&texture),
                 SpriteInputIndex::AtlasTexture as usize,
             );
-            let hdr_params = HdrParams {
-                headroom: self.hdr_headroom,
-                is_hdr: if texture_id.kind == gpui::AtlasTextureKind::PolychromeHdr {
-                    1.0
-                } else {
-                    0.0
-                },
-            };
-            command_encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&hdr_params).cast(),
-                mem::size_of_val(&hdr_params),
-                SpriteInputIndex::HdrParams as usize,
+            self.set_hdr_params(
+                command_encoder,
+                texture_id.kind == gpui::AtlasTextureKind::PolychromeHdr,
             );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
@@ -1950,6 +1902,29 @@ impl MetalRenderer {
                 6,
                 sprites.len(),
                 sprites.start,
+            );
+        }
+    }
+
+    /// Binds the polychrome sprite fragment's [`HdrParams`] — every draw with that pipeline must,
+    /// gpui-fast's scroll layer tile composite included (`fast::layers::composite`): unbound, the
+    /// shader reads whatever the slot holds and may soft-clip SDR pixels into a stale headroom.
+    pub(crate) fn set_hdr_params(
+        &self,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        is_hdr: bool,
+    ) {
+        let hdr_params = HdrParams {
+            headroom: self.hdr_headroom,
+            is_hdr: if is_hdr { 1.0 } else { 0.0 },
+        };
+        // SAFETY: Metal copies the bytes of the live value into the fragment slot the shader's
+        // `HdrParams` reads.
+        unsafe {
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&hdr_params).cast(),
+                mem::size_of_val(&hdr_params),
+                SpriteInputIndex::HdrParams as usize,
             );
         }
     }

@@ -228,7 +228,8 @@ pub(super) fn tiled_scene(
     let mut scene = gpui::Scene::default();
     scene.insert_primitive(gpui::PolychromeSprite {
         order: 0,
-        pad: 0,
+        pixelated: 0,
+        transformation: gpui::TransformationMatrix::unit(),
         grayscale: false.into(),
         opacity: 1.,
         bounds,

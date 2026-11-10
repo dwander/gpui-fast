@@ -86,7 +86,8 @@ fn rounded_overflow_mask_cost(cx: &mut gpui::TestAppContext) {
                     descriptor.setWidth(side as usize);
                     descriptor.setHeight(side as usize);
                 }
-                descriptor.setPixelFormat(objc2_metal::MTLPixelFormat::BGRA8Unorm);
+                // [PiCell] The pipelines' format (half float for HDR), as the drawable's is.
+                descriptor.setPixelFormat(crate::metal_renderer::RENDER_TARGET_FORMAT);
                 descriptor.setStorageMode(objc2_metal::MTLStorageMode::Private);
                 descriptor.setUsage(objc2_metal::MTLTextureUsage::RenderTarget);
                 let target = harness
@@ -546,7 +547,8 @@ fn tile_sprite(
     let bounds = layer.tile_bounds(tile);
     PolychromeSprite {
         order: 0,
-        pad: 0,
+        pixelated: 0,
+        transformation: gpui::TransformationMatrix::unit(),
         grayscale: false.into(),
         opacity: 1.,
         bounds: sp(
@@ -642,10 +644,20 @@ fn composite_and_compare(
     assert_same_pixels(&actual, &expected, width);
 }
 
+/// [PiCell] Equal up to one 8-bit step per channel. Our targets and tiles are half float (HDR), so
+/// they keep differences an 8-bit target rounded away — a tile's background is its clear colour,
+/// converted on the CPU, where drawing directly paints it with the quad shader — and the 8-bit
+/// readback then lands a step apart now and then. Upstream's 8-bit targets matched exactly.
 fn assert_same_pixels(actual: &[u8], expected: &[u8], width: usize) {
+    const READBACK_STEP: u8 = 1;
     assert_eq!(actual.len(), expected.len());
     let differing: Vec<(usize, usize)> = (0..actual.len() / 4)
-        .filter(|i| actual[i * 4..i * 4 + 4] != expected[i * 4..i * 4 + 4])
+        .filter(|i| {
+            actual[i * 4..i * 4 + 4]
+                .iter()
+                .zip(&expected[i * 4..i * 4 + 4])
+                .any(|(a, b)| a.abs_diff(*b) > READBACK_STEP)
+        })
         .map(|i| (i % width, i / width))
         .collect();
     if differing.is_empty() {
@@ -766,7 +778,8 @@ fn add_content(
     });
     scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: 0,
+        pixelated: 0,
+        transformation: gpui::TransformationMatrix::unit(),
         grayscale: false.into(),
         opacity: 1.,
         bounds: at(300., 500., 20., 20.),
@@ -876,6 +889,7 @@ fn image_tile(harness: &Harness) -> AtlasTile {
     let key = AtlasKey::Image(RenderImageParams {
         image_id: ImageId(9_999),
         frame_index: 0,
+        hdr: false,
     });
     let bytes: Vec<u8> = (0..20 * 20)
         .flat_map(|i: u32| {

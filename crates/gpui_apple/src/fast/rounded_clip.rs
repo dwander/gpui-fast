@@ -124,9 +124,12 @@ pub(crate) fn draw(
     let command_buffer = queue.commandBuffer().context("creating command buffer")?;
     crate::fast::dynamic_textures::encode_uploads(&command_buffer);
     let alpha = if renderer.opaque { 1. } else { 0. };
+    // [PiCell] A frame with a blur filter draws through the offscreen scene, as upstream's loop
+    // does, and is copied to `texture` at the end.
+    let mut filters = crate::picell_filters::FilterTargets::begin(renderer, scene);
     let encoder = new_command_encoder_for_texture(
         &command_buffer,
-        texture,
+        crate::picell_filters::target(&filters, texture),
         viewport,
         Some(MTLClearColor {
             red: 0.,
@@ -144,10 +147,14 @@ pub(crate) fn draw(
         viewport,
         &command_buffer,
         &mut Vec::new(),
+        &mut filters,
         surface_textures,
         encoder,
     )?
     .endEncoding();
+    if let Some(filters) = &filters {
+        filters.finish(renderer, &command_buffer, texture, viewport)?;
+    }
     Ok(command_buffer)
 }
 
@@ -162,10 +169,9 @@ pub(crate) fn draw_tile(
     background: MTLClearColor,
     surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
 ) -> Result<()> {
-    let old_texture = renderer.path_intermediate_texture.take();
-    let old_msaa = renderer.path_intermediate_msaa_texture.take();
-    let result = (|| {
-        renderer.update_path_intermediate_textures(viewport)?;
+    // [PiCell] Swaps in tile-sized path textures alone: `update_path_intermediate_textures` would
+    // also leave the blur targets tile-sized for the next frame.
+    renderer.with_tile_path_textures(viewport, |renderer| {
         let bindings = write_instances(scene, writer)?;
         let encoder =
             new_command_encoder_for_texture(commands, texture, viewport, Some(background))?;
@@ -178,15 +184,14 @@ pub(crate) fn draw_tile(
             viewport,
             commands,
             &mut Vec::new(),
+            // A scroll layer never holds a filter.
+            &mut None,
             surface_textures,
             encoder,
         )?
         .endEncoding();
         Ok(())
-    })();
-    renderer.path_intermediate_texture = old_texture;
-    renderer.path_intermediate_msaa_texture = old_msaa;
-    result
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,6 +204,7 @@ fn encode(
     viewport: Size<DevicePixels>,
     commands: &ProtocolObject<dyn MTLCommandBuffer>,
     clips: &mut Vec<Clip>,
+    filters: &mut Option<crate::picell_filters::FilterTargets>,
     surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     mut encoder: Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
@@ -252,6 +258,7 @@ fn encode(
                             viewport,
                             commands,
                             clips,
+                            filters,
                             surface_textures,
                             encoder,
                         )?;
@@ -268,7 +275,9 @@ fn encode(
                 let paths = &scene.paths[range];
                 let drawn =
                     renderer.draw_paths_to_intermediate(paths, writer, viewport, commands)?;
-                encoder = new_command_encoder_for_texture(commands, texture, viewport, None)?;
+                // [PiCell] Back to the filter target the batches draw into, when there is one.
+                let target = crate::picell_filters::target(filters, texture);
+                encoder = new_command_encoder_for_texture(commands, target, viewport, None)?;
                 bind(&encoder, clips, &renderer.device);
                 if drawn {
                     renderer.draw_paths_from_intermediate(paths, writer, viewport, &encoder)?;
@@ -283,10 +292,30 @@ fn encode(
                 surface_textures,
             )?,
             PrimitiveBatch::SubpixelSprites { .. } => unreachable!("Metal uses grayscale glyphs"),
-            // [PiCell] TODO(mac): blur filters inside a frame with rounded clip groups are not
-            // drawn yet — the passes live in upstream's loop (`MetalRenderer`), which this one
-            // replaces for such a frame.
-            PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => {}
+            // [PiCell] Blur filters, through the targets upstream's loop shares. Each hands back a
+            // new encoder; the next batch binds the clip stack on it again.
+            PrimitiveBatch::BackdropFilters(range) => {
+                if let Some(targets) = filters.as_ref() {
+                    encoder = targets.backdrop_filters(
+                        renderer,
+                        commands,
+                        encoder,
+                        &scene.backdrop_filters[range],
+                        viewport,
+                    )?;
+                }
+            }
+            PrimitiveBatch::FilterBoundary(ix) => {
+                if let Some(targets) = filters.as_mut() {
+                    encoder = targets.boundary(
+                        renderer,
+                        commands,
+                        encoder,
+                        &scene.filter_boundaries[ix],
+                        viewport,
+                    )?;
+                }
+            }
         }
     }
     Ok(encoder)
