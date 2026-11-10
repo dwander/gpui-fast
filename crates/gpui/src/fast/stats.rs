@@ -308,10 +308,26 @@ impl Window {
 /// [PiCell] 트라이얼 진단 — `PICELL_FAST_STATS=1` 이면 1초마다 그 사이 그린 프레임의 작업량
 /// (뷰 재빌드·재사용, 스크롤 레이어, 단계별 시간)을 `log::info!` 로 남기고 카운터를 비운다.
 /// 테스트 빌드 밖에서는 `Window::layout_stats` 가 없어 앱에서 Retained Mode 효과를 볼 길이 없다.
+fn picell_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PICELL_FAST_STATS").is_ok_and(|v| v == "1"))
+}
+
+thread_local! {
+    static PICELL_RENDERS: std::cell::RefCell<std::collections::HashMap<&'static str, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// [PiCell] 트라이얼 진단 — 뷰 render 가 실제로 불린 횟수를 타입 이름별로 센다.
+pub(crate) fn picell_note_render(type_name: &'static str) {
+    if picell_enabled() {
+        PICELL_RENDERS.with_borrow_mut(|renders| *renders.entry(type_name).or_default() += 1);
+    }
+}
+
 pub(crate) fn picell_log(window: &mut Window) {
     use std::cell::Cell;
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("PICELL_FAST_STATS").is_ok_and(|v| v == "1")) {
+    if !picell_enabled() {
         return;
     }
     thread_local! {
@@ -347,4 +363,16 @@ pub(crate) fn picell_log(window: &mut Window) {
         prepaint.as_secs_f64() * 1000.0 / frames as f64,
         paint.as_secs_f64() * 1000.0 / frames as f64,
     );
+    let mut renders: Vec<(&'static str, u64)> =
+        PICELL_RENDERS.with_borrow_mut(|renders| renders.drain().collect());
+    renders.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = renders
+        .iter()
+        .take(8)
+        .map(|(name, count)| {
+            let short = name.rsplit("::").next().unwrap_or(name);
+            format!("{short}×{count}")
+        })
+        .collect();
+    log::info!("[fast-stats] renders: {}", top.join(" "));
 }

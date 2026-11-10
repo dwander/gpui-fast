@@ -185,6 +185,7 @@ mod any_view {
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
         crate::fast::dependencies::render_next(&mut cx.entities, view.entity_id());
+        crate::fast::stats::picell_note_render(std::any::type_name::<V>());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -236,6 +237,7 @@ impl<T: Render> View for Entity<T> {
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         crate::fast::dependencies::render_next(&mut cx.entities, self.entity_id());
+        crate::fast::stats::picell_note_render(std::any::type_name::<T>());
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
