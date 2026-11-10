@@ -216,6 +216,10 @@ fn live_textures() -> parking_lot::MappedMutexGuard<'static, HashMap<DynamicText
     })
 }
 
+/// [PiCell] How far a painted version is shifted in `PolychromeSprite::pixelated`, past the
+/// sampling flag bits the shaders read (`PolychromeSprite::WIDE_GAMUT` is the highest, 8).
+const PAINTED_VERSION_SHIFT: u32 = 8;
+
 /// The version a sprite painted now must carry: a changing texture version,
 /// so a cached frame holding a sprite of a refreshed texture is told apart
 /// from the new one.
@@ -366,7 +370,10 @@ pub(crate) fn paint(
     };
     window.next_frame.scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: painted_version(texture.id),
+        // [PiCell] `pixelated` is the field upstream calls `pad`. Its low bits are PiCell's
+        // sampling flags (`PolychromeSprite::PIXELATED` …), so the version rides above them.
+        pixelated: painted_version(texture.id) << PAINTED_VERSION_SHIFT,
+        transformation: crate::TransformationMatrix::unit(),
         grayscale: false.into(),
         bounds: window.snap_bounds(bounds),
         content_mask: window.snapped_content_mask(),

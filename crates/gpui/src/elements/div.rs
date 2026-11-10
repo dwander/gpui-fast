@@ -17,6 +17,7 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, BackGestureEvent, Bounds, ClickEvent,
+    CursorStyle,
     DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
     ExternalDragPayloadSource, FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox,
     HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
@@ -403,6 +404,23 @@ impl Interactivity {
         listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
     ) {
         self.on_scroll(listener);
+    }
+
+    /// Bind the given callback to scroll events during the capture phase.
+    ///
+    /// Capture runs outermost-first, so a listener here sees the event before any
+    /// descendant does and can call [`App::propagate`](crate::App::stop_propagation)
+    /// to keep an inner scroll container from consuming it. The bubble phase runs
+    /// innermost-first, which is too late to preempt descendants.
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn capture_scroll(&mut self, listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static) {
+        self.scroll_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.should_handle_scroll(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
     }
 
     /// Bind the given callback to pinch gesture events during the bubble phase.
@@ -1098,6 +1116,18 @@ pub trait InteractiveElement: Sized {
         self.on_scroll(listener)
     }
 
+    /// Bind the given callback to scroll events during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_scroll`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn capture_scroll(
+        mut self,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_scroll(listener);
+        self
+    }
+
     /// Bind the given callback to pinch gesture events during the bubble phase.
     /// The fluent API equivalent to [`Interactivity::on_pinch`].
     ///
@@ -1679,6 +1709,16 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the cursor shown while this element is being dragged, independent of its hover
+    /// cursor. When unset, the drag uses the element's hover cursor (`.cursor(...)`).
+    fn drag_cursor(mut self, style: CursorStyle) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().drag_cursor_style = Some(style);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -2253,6 +2293,9 @@ pub struct Interactivity {
     pub(crate) click_listeners: crate::fast::interactivity::LazyVec<ClickListener>,
     pub(crate) aux_click_listeners: crate::fast::interactivity::LazyVec<ClickListener>,
     pub(crate) drag_listener: crate::fast::interactivity::Rare<DragListener>,
+    /// Cursor shown while this element is being dragged. When unset, the drag falls
+    /// back to the element's hover cursor (`mouse_cursor`).
+    pub(crate) drag_cursor_style: Option<CursorStyle>,
     pub(crate) hover_listener:
         crate::fast::interactivity::Rare<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
@@ -2988,7 +3031,9 @@ impl Interactivity {
             }
         }
 
-        let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
+        let drag_cursor_style = self
+            .drag_cursor_style
+            .or(self.base_style.as_ref().mouse_cursor);
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
         let drop_listeners = mem::take(&mut self.drop_listeners);
@@ -2997,12 +3042,32 @@ impl Interactivity {
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
 
         if !drop_listeners.is_empty() {
+            // Under the cursor and able to take what's being dragged? Latch it on the window so the
+            // platform can show the drag as accepted here (and as refused everywhere else).
+            //
+            // Modality-independent on purpose: an OS-driven drag takes the pointer captive and
+            // sends us no mouse events of its own, so if the last thing the user did in this
+            // window was press a key, `is_hovered` would report nothing hovered for the whole
+            // drag and every drop target would go dead.
+            if let Some(drag) = cx.active_drag.take() {
+                let drag_type = drag.value.as_ref().type_id();
+                let accepts = drop_listeners.iter().any(|(ty, _)| *ty == drag_type)
+                    && hitbox.id.is_hovered_ignoring_last_input(window)
+                    && can_drop_predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate(drag.value.as_ref(), window, cx));
+                if accepts {
+                    window.mark_drop_target_hovered();
+                }
+                cx.active_drag = Some(drag);
+            }
+
             let hitbox = hitbox.clone();
             window.on_mouse_event({
                 move |_: &MouseUpEvent, phase, window, cx| {
                     if let Some(drag) = &cx.active_drag
                         && phase == DispatchPhase::Bubble
-                        && hitbox.is_hovered(window)
+                        && hitbox.id.is_hovered_ignoring_last_input(window)
                     {
                         let drag_state_type = drag.value.as_ref().type_id();
                         for (drop_state_type, listener) in &drop_listeners {
@@ -3607,14 +3672,15 @@ impl Interactivity {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
                             && *state_type == drag.value.as_ref().type_id()
-                            && group_hitbox_id.is_hovered(window)
+                            && group_hitbox_id.is_hovered_ignoring_last_input(window)
                         {
                             style.refine(&group_drag_style.style);
                         }
                     }
 
                     for (state_type, build_drag_over_style) in &self.drag_over_styles {
-                        if *state_type == drag.value.as_ref().type_id() && hitbox.is_hovered(window)
+                        if *state_type == drag.value.as_ref().type_id()
+                            && hitbox.id.is_hovered_ignoring_last_input(window)
                         {
                             style.refine(&build_drag_over_style(drag.value.as_ref(), window, cx));
                         }

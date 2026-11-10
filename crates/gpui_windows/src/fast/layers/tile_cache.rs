@@ -354,7 +354,11 @@ pub(crate) fn global_params(width: u32, height: u32) -> GlobalParams {
         grayscale_enhanced_contrast: font_info.grayscale_enhanced_contrast,
         subpixel_enhanced_contrast: font_info.subpixel_enhanced_contrast,
         is_bgr: font_info.is_bgr as u32,
-        _pad: [0; 3],
+        // [PiCell] Tiles are 8-bit SDR targets: HDR sprites are compressed into SDR there, as on
+        // an SDR swap chain, and the HDR output pass never reads them.
+        hdr_headroom: 1.0,
+        hdr_output_scale: 1.0,
+        _pad: 0,
     }
 }
 

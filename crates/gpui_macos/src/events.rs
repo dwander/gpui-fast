@@ -25,7 +25,11 @@ use objc2_app_kit::{
     NSModeSwitchFunctionKey, NSPageDownFunctionKey, NSPageUpFunctionKey, NSRightArrowFunctionKey,
     NSUpArrowFunctionKey,
 };
-use std::{borrow::Cow, ffi::c_void};
+use std::{
+    borrow::Cow,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub(crate) const ESCAPE_KEY: u16 = 0x1b;
 
@@ -42,6 +46,80 @@ const SHIFT_TAB_KEY: u32 = 0x19;
 // See https://developer.apple.com/documentation/appkit/nsmenuitem/keyequivalent#Discussion
 const BACKSPACE_KEY_EQUIVALENT: u32 = 0x08;
 const DELETE_KEY_EQUIVALENT: u32 = 0x7f;
+
+// ── 키패드 구분 (kVK_ANSI_Keypad* — Carbon `Events.h`) ──
+//
+// macOS 에는 NumLock 이 없어 키패드 숫자가 **문자로는 메인 숫자열과 구분되지 않는다**
+// (`charactersIgnoringModifiers` 가 똑같이 "1" 을 준다). 구분이 남아 있는 곳은 `keyCode`
+// 뿐이라 [`keypad_key`] 가 여기서 가른다.
+const KEYPAD_DECIMAL: u16 = 0x41;
+const KEYPAD_MULTIPLY: u16 = 0x43;
+/// PC 배열 키패드의 NumLock 자리 (애플 키보드에는 `clear` 로 각인돼 있다).
+const KEYPAD_CLEAR: u16 = 0x47;
+const KEYPAD_ENTER: u16 = 0x4c;
+const KEYPAD_0: u16 = 0x52;
+const KEYPAD_1: u16 = 0x53;
+const KEYPAD_2: u16 = 0x54;
+const KEYPAD_3: u16 = 0x55;
+const KEYPAD_4: u16 = 0x56;
+const KEYPAD_5: u16 = 0x57;
+const KEYPAD_6: u16 = 0x58;
+const KEYPAD_7: u16 = 0x59;
+const KEYPAD_8: u16 = 0x5b;
+const KEYPAD_9: u16 = 0x5c;
+
+/// 키패드 내비게이션 모드 — 켜면 키패드 숫자·Enter 가 **NumLock 을 끈 것처럼** 방향키·편집키로
+/// 들어온다. macOS 에 NumLock 이 없어 키패드를 리모컨처럼 쓰는 앱이 직접 흉내내야 한다.
+///
+/// 이 값이 모드의 **단일 원천**이다 — [`parse_keystroke`] 는 `App` 을 볼 수 없어 앱 쪽 상태를
+/// 읽어 올 수 없으므로, 앱이 [`set_keypad_nav_mode`] 로 여기에 쓰고 [`keypad_nav_mode`] 로 읽는다.
+/// (선례: `window.rs` 의 `DRAG_MOVE_IS_DEFAULT`)
+static KEYPAD_NAV_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 키패드 내비게이션 모드를 켜고 끈다. 꺼진 상태(기본)의 키 이름은 예전과 완전히 같다.
+pub fn set_keypad_nav_mode(on: bool) {
+    KEYPAD_NAV_MODE.store(on, Ordering::Relaxed);
+}
+
+/// 키패드 내비게이션 모드가 켜져 있는가.
+pub fn keypad_nav_mode() -> bool {
+    KEYPAD_NAV_MODE.load(Ordering::Relaxed)
+}
+
+/// 키패드 키의 이름. 키패드가 아니거나 번역할 게 없으면 `None` (기존 경로로 넘어간다).
+///
+/// `kp_clear` · `kp_multiply` 는 **모드와 무관하게 항상** 갈라 낸다 — 모드를 켜는 키 자체라
+/// 꺼져 있을 때도 구분되지 않으면 켤 방법이 없다. 나머지는 모드가 켜져 있을 때만 번역해서
+/// 꺼진 상태의 동작을 예전 그대로 남긴다 (키패드 `+ - /` 는 어느 모드에서도 건드리지 않는다 —
+/// 문자 그대로 들어가는 게 맞는 키들이다).
+///
+/// 0 · 5 · . 는 NumLock 을 꺼도 방향키가 되지 않는 자리라 `kp_*` 이름 그대로 내보낸다.
+/// 기본 바인딩이 없어 아무 일도 하지 않고(= 삼켜지고), 원하는 사용자는 직접 할당할 수 있다.
+pub(crate) fn keypad_key(code: CGKeyCode) -> Option<&'static str> {
+    match code {
+        KEYPAD_CLEAR => return Some("kp_clear"),
+        KEYPAD_MULTIPLY => return Some("kp_multiply"),
+        _ => {}
+    }
+    if !keypad_nav_mode() {
+        return None;
+    }
+    Some(match code {
+        KEYPAD_8 => "up",
+        KEYPAD_2 => "down",
+        KEYPAD_4 => "left",
+        KEYPAD_6 => "right",
+        KEYPAD_7 => "home",
+        KEYPAD_1 => "end",
+        KEYPAD_9 => "pageup",
+        KEYPAD_3 => "pagedown",
+        KEYPAD_ENTER => "kp_enter",
+        KEYPAD_0 => "kp_0",
+        KEYPAD_5 => "kp_5",
+        KEYPAD_DECIMAL => "kp_decimal",
+        _ => return None,
+    })
+}
 
 pub(crate) fn key_to_menu_equivalent(key: &str) -> Cow<'_, str> {
     let code = match key {
@@ -345,6 +423,17 @@ pub(crate) unsafe fn platform_input_from_native(
     }
 }
 
+/// 이 키다운을 [`keypad_key`] 가 다른 이름으로 바꿔 내보내는가.
+///
+/// `window.rs` 가 **IME 를 먼저 태울지** 정할 때 쓴다. 번역된 키의 원본 NSEvent 는 여전히
+/// "8" · "*" 같은 **인쇄 가능한 문자**를 들고 있어서, 그대로 `NSTextInputContext` 에 넘기면
+/// `insertText:` 로 소비되고(YES 반환) 키맵까지 오지 못한다. 진짜 방향키가 같은 경로를
+/// 무사히 지나는 것은 문자가 비인쇄 문자라 `doCommandBySelector:` 로 빠지기 때문인데,
+/// 번역된 키패드는 그 성질을 물려받지 못한다.
+pub(crate) fn is_keypad_event(native_event: &NSEvent) -> bool {
+    keypad_key(native_event.keyCode()).is_some()
+}
+
 fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
     let characters = unsafe {
         let characters: *mut AnyObject = msg_send![native_event, charactersIgnoringModifiers];
@@ -361,6 +450,24 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
     let function = modifiers.contains(NSEventModifierFlags::Function)
         && first_char
             .is_none_or(|ch| !(NSUpArrowFunctionKey..=NSModeSwitchFunctionKey).contains(&ch));
+
+    // 키패드는 문자로 구분되지 않으므로 keyCode 로 먼저 가른다 ([`keypad_key`]).
+    // `key_char` 는 비운다 — 방향키로 번역된 키가 텍스트로도 들어가면 안 된다.
+    // `function` 도 끈다: 키패드에는 fn 키가 없어 잃을 정보가 없고, Clear 키가
+    // NSFunctionKeyMask 를 함께 켜 오면 바인딩이 `fn-kp_clear` 로 어긋난다.
+    if let Some(key) = keypad_key(native_event.keyCode()) {
+        return Keystroke {
+            modifiers: Modifiers {
+                control,
+                alt,
+                shift,
+                platform: command,
+                function: false,
+            },
+            key: key.to_string(),
+            key_char: None,
+        };
+    }
 
     #[allow(non_upper_case_globals)]
     let key = match first_char {

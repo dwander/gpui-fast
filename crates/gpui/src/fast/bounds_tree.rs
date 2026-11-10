@@ -62,6 +62,10 @@ where
     /// How many more bounds replaying may compare against, over every search
     /// it makes, before the tree is built instead.
     replay_search_budget: usize,
+    /// [PiCell] Minimum ordering assigned to any subsequent insert. Raised before painting
+    /// deferred draws so overlays always sort above the main scene (and their orders can't fall
+    /// inside a content-filter order range from the main scene). 0 means no floor.
+    order_floor: u32,
 }
 
 /// The grid a [`BoundsTree`] keeps its bounds in. Cell `(column, row)`
@@ -435,6 +439,7 @@ where
         self.replaying = true;
         self.changed.clear();
         self.replay_search_budget = REPLAY_SEARCH_BUDGET;
+        self.order_floor = 0;
     }
 
     /// Clears the tree and forgets what was inserted before, so the next fill
@@ -460,7 +465,46 @@ where
             self.build_from_recorded();
         }
 
-        let ordering = self.find_max_ordering(&new_bounds) + 1;
+        let ordering = (self.find_max_ordering(&new_bounds) + 1).max(self.order_floor);
+        self.add(&new_bounds, ordering);
+        self.recorded.push((new_bounds, ordering));
+        ordering
+    }
+
+    /// [PiCell] Stops handing out last frame's orderings and builds the grid from what has
+    /// been inserted so far. The order floor and [`Self::insert_above_all`] depend on every
+    /// bounds inserted, not only the ones a new bounds meets, which replaying does not track;
+    /// they are used once a frame at most (deferred draws, content-filter groups), so what
+    /// follows them is ordered as upstream does.
+    fn stop_replaying(&mut self) {
+        if self.replaying {
+            self.replaying = false;
+            self.build_from_recorded();
+        }
+    }
+
+    /// [PiCell] Raise the minimum ordering for subsequent inserts to `floor`. Relative
+    /// ordering above the floor is preserved (overlapping inserts still step above one
+    /// another).
+    pub fn set_order_floor(&mut self, floor: u32) {
+        if floor > self.order_floor {
+            self.stop_replaying();
+            self.order_floor = floor;
+        }
+    }
+
+    /// [PiCell] The highest ordering assigned to any bounds so far (0 if empty).
+    pub fn max_order(&mut self) -> u32 {
+        self.stop_replaying();
+        self.max.as_ref().map_or(0, |(_, ordering)| *ordering)
+    }
+
+    /// [PiCell] Inserts bounds with an ordering strictly greater than *every* existing bounds
+    /// (not just intersecting ones), and returns that ordering. Used for content-filter group
+    /// boundaries, which must sort after all previously-painted content so their order range
+    /// can't collide with unrelated non-overlapping content that reuses low orderings.
+    pub fn insert_above_all(&mut self, new_bounds: Bounds<U>) -> u32 {
+        let ordering = (self.max_order() + 1).max(self.order_floor);
         self.add(&new_bounds, ordering);
         self.recorded.push((new_bounds, ordering));
         ordering
@@ -604,6 +648,7 @@ where
                 unmarked: false,
             },
             replay_search_budget: REPLAY_SEARCH_BUDGET,
+            order_floor: 0,
         }
     }
 }

@@ -58,6 +58,55 @@ pub fn web_init() {
     gpui_web::init_logging();
 }
 
+/// Sets what a modifier-free drop means to this app — `true` = move, `false` = copy (the default).
+///
+/// On Windows this only affects the badge drawn on the drag cursor while an OS drag hovers one of
+/// our windows, so that the feedback matches what the app will actually do with the drop; the app
+/// still decides the operation itself. On macOS it also picks what an outbound drag offers the
+/// destination, because there the destination performs the operation it chooses from that offer.
+/// No-op on platforms with no drop effect to drive.
+#[cfg(target_os = "windows")]
+pub fn set_drag_move_is_default(is_move: bool) {
+    gpui_windows::set_drag_move_is_default(is_move);
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_drag_move_is_default(is_move: bool) {
+    gpui_macos::set_drag_move_is_default(is_move);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn set_drag_move_is_default(_is_move: bool) {}
+
+/// Turns keypad navigation mode on or off (macOS only).
+///
+/// macOS has no NumLock, so a numeric keypad always reports digits and an app that wants the
+/// keypad to work as a navigation cluster has to emulate it. While this is on, the keypad's
+/// digits and Enter arrive as `up`/`down`/`left`/`right`/`home`/`end`/`pageup`/`pagedown`/
+/// `kp_enter` instead of characters. Off (the default) nothing changes.
+///
+/// The keypad's `clear` (the NumLock position on a PC-layout keypad) and `*` always arrive as
+/// `kp_clear` and `kp_multiply` so the app has a key to toggle the mode with. No-op elsewhere,
+/// where NumLock already does this in hardware.
+#[cfg(target_os = "macos")]
+pub fn set_keypad_nav_mode(on: bool) {
+    gpui_macos::set_keypad_nav_mode(on);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_keypad_nav_mode(_on: bool) {}
+
+/// Whether keypad navigation mode is on. Always false where it does not apply.
+#[cfg(target_os = "macos")]
+pub fn keypad_nav_mode() -> bool {
+    gpui_macos::keypad_nav_mode()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn keypad_nav_mode() -> bool {
+    false
+}
+
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     cfg_select! {

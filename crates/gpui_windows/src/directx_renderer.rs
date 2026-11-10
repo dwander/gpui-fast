@@ -1,6 +1,7 @@
 use std::{
     slice,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -20,14 +21,34 @@ use windows::{
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+use crate::hdr_display::{self, HdrDisplay};
 use crate::*;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 pub(crate) const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+/// Swap chain and scene targets while HDR output is on (see [`HdrOutput`]). The swap chain is then
+/// scRGB — linear light, BT.709 primaries, 1.0 = 80 nits — and the scene targets keep the same
+/// sRGB-encoded values as the 8-bit pipeline, only with room above 1.0.
+const HDR_RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
+/// How often the display under the window is re-read while HDR is wanted — the app asks every
+/// frame, but monitor moves, the HDR toggle and the SDR brightness slider send no message to the
+/// renderer.
+const HDR_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// Set to log statistics of the HDR swap chain (scRGB min/max/mean, share above SDR white) at most
+/// every [`HDR_DIAGNOSTICS_INTERVAL`]. HDR can't be checked by eye or screenshot — capture APIs
+/// tone-map it — so this is how its output gets verified.
+const HDR_DIAGNOSTICS_ENV: &str = "GPUI_HDR_DIAGNOSTICS";
+const HDR_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(2);
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+
+/// Number of content-filter (`filter`) nesting levels that get their own isolated group target.
+/// Two covers the realistic "a blurred element inside another blurred element" case; deeper nests
+/// render inline (unblurred at the inner level) rather than allocating unbounded VRAM. Must match
+/// the wgpu backend's `MAX_FILTER_DEPTH` so nested blur renders consistently across platforms.
+const MAX_FILTER_DEPTH: usize = 2;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -49,7 +70,7 @@ pub(crate) struct DirectXRenderer {
     pub(crate) width: u32,
     pub(crate) height: u32,
 
-    /// Whether we want to skip drwaing due to device lost events.
+    /// Whether we want to skip drawing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
@@ -57,6 +78,40 @@ pub(crate) struct DirectXRenderer {
     pub(crate) fast_frame: crate::fast::frame::FrameState,
     pub(crate) fast_composition: crate::fast::composition::DirectXComposition,
     pub(crate) fast_recovery: crate::fast::device_recovery::RecoveryState,
+
+    /// The render target currently bound for the main scene this frame (the offscreen
+    /// `scene_color` when blur filters are present, a content-filter group texture inside such a
+    /// group, or the swapchain otherwise). `draw_paths_to_intermediate` restores to this after
+    /// its own pass so paths land on the correct target.
+    active_render_target: Option<ID3D11RenderTargetView>,
+
+    hdr: HdrOutput,
+}
+
+/// HDR (scRGB) output. Off until the app asks for it ([`DirectXRenderer::set_hdr_content`]) *and*
+/// the window's display has Windows HDR on; only then are the swap chain and the scene targets
+/// FP16, so every other window keeps the 8-bit pipeline and half the memory.
+///
+/// While on, the scene is drawn into the FP16 `scene_color` exactly as it would be drawn into the
+/// 8-bit swap chain — sRGB-encoded, premultiplied — so blending, text gamma and blur stay as tuned;
+/// a final pass converts it to scRGB, putting SDR white at the user's SDR brightness.
+#[derive(Default)]
+struct HdrOutput {
+    /// What the app asked for last.
+    wanted: bool,
+    /// The display's current headroom (multiples of SDR white) that HDR sprites are soft-clipped
+    /// into, as the app reported it.
+    headroom: f32,
+    /// The swap chain and scene targets are FP16 right now.
+    active: bool,
+    /// Switching to FP16 failed; stay SDR until the app renews its request.
+    failed: bool,
+    /// The display under the window, re-read every [`HDR_PROBE_INTERVAL`] while HDR is wanted.
+    display: Option<HdrDisplay>,
+    last_probe: Option<Instant>,
+    /// Factory used only for probing, replaced whenever DXGI reports it stale.
+    probe_factory: Option<IDXGIFactory1>,
+    last_diagnostics: Option<Instant>,
 }
 
 /// Direct3D objects
@@ -82,8 +137,72 @@ pub(crate) struct DirectXResources {
     pub(crate) path_intermediate_msaa_texture: ID3D11Texture2D,
     pub(crate) path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
 
+    // Offscreen targets for blur filters (each is render-target + shader-resource).
+    pub(crate) blur: BlurResources,
+
     // Cached viewport
-    viewport: D3D11_VIEWPORT,
+    pub(crate) viewport: D3D11_VIEWPORT,
+}
+
+/// Offscreen render targets used by the blur filters. The scene is rendered into `scene_color`
+/// (so filters can sample it), `ping`/`pong` are half-resolution scratch for the separable
+/// gaussian, and `groups` isolate content-filter (`filter`) subtrees — one per nesting level
+/// (indexed by isolation depth), up to [`MAX_FILTER_DEPTH`], so nested content blurs isolate
+/// correctly; deeper nests render inline.
+pub(crate) struct BlurResources {
+    #[expect(dead_code)]
+    scene_color: ID3D11Texture2D,
+    pub(crate) scene_color_rtv: Option<ID3D11RenderTargetView>,
+    pub(crate) scene_color_srv: Option<ID3D11ShaderResourceView>,
+    #[expect(dead_code)]
+    ping: ID3D11Texture2D,
+    pub(crate) ping_rtv: Option<ID3D11RenderTargetView>,
+    pub(crate) ping_srv: Option<ID3D11ShaderResourceView>,
+    #[expect(dead_code)]
+    pong: ID3D11Texture2D,
+    pub(crate) pong_rtv: Option<ID3D11RenderTargetView>,
+    pub(crate) pong_srv: Option<ID3D11ShaderResourceView>,
+    // Kept alive for the lifetime of their views; indexed by isolation depth.
+    #[expect(dead_code)]
+    groups: Vec<ID3D11Texture2D>,
+    pub(crate) group_rtvs: Vec<Option<ID3D11RenderTargetView>>,
+    pub(crate) group_srvs: Vec<Option<ID3D11ShaderResourceView>>,
+}
+
+impl BlurResources {
+    /// `format` follows the swap chain: FP16 while HDR output is on, so a blurred or isolated
+    /// group over an HDR image keeps its highlights.
+    fn new(device: &ID3D11Device, width: u32, height: u32, format: DXGI_FORMAT) -> Result<Self> {
+        let half_w = (width / 2).max(1);
+        let half_h = (height / 2).max(1);
+        let (scene_color, scene_color_rtv, scene_color_srv) =
+            create_color_target(device, width, height, format)?;
+        let (ping, ping_rtv, ping_srv) = create_color_target(device, half_w, half_h, format)?;
+        let (pong, pong_rtv, pong_srv) = create_color_target(device, half_w, half_h, format)?;
+        let mut groups = Vec::with_capacity(MAX_FILTER_DEPTH);
+        let mut group_rtvs = Vec::with_capacity(MAX_FILTER_DEPTH);
+        let mut group_srvs = Vec::with_capacity(MAX_FILTER_DEPTH);
+        for _ in 0..MAX_FILTER_DEPTH {
+            let (group, group_rtv, group_srv) = create_color_target(device, width, height, format)?;
+            groups.push(group);
+            group_rtvs.push(group_rtv);
+            group_srvs.push(group_srv);
+        }
+        Ok(Self {
+            scene_color,
+            scene_color_rtv,
+            scene_color_srv,
+            ping,
+            ping_rtv,
+            ping_srv,
+            pong,
+            pong_rtv,
+            pong_srv,
+            groups,
+            group_rtvs,
+            group_srvs,
+        })
+    }
 }
 
 pub(crate) struct DirectXRenderPipelines {
@@ -95,6 +214,22 @@ pub(crate) struct DirectXRenderPipelines {
     pub(crate) mono_sprites: PipelineState<MonochromeSprite>,
     pub(crate) subpixel_sprites: PipelineState<SubpixelSprite>,
     pub(crate) poly_sprites: PipelineState<PolychromeSprite>,
+    // Blur (backdrop-filter / filter). These don't use the generic PipelineState since they
+    // sample a texture rather than read a structured instance buffer; their parameters live in
+    // a dedicated constant buffer at register b3.
+    pub(crate) blur_downsample_vertex: ID3D11VertexShader,
+    pub(crate) blur_downsample_fragment: ID3D11PixelShader,
+    pub(crate) blur_vertex: ID3D11VertexShader,
+    pub(crate) blur_fragment: ID3D11PixelShader,
+    pub(crate) blur_composite_vertex: ID3D11VertexShader,
+    pub(crate) blur_composite_fragment: ID3D11PixelShader,
+    pub(crate) blur_params_buffer: ID3D11Buffer,
+    pub(crate) blur_blend_replace: ID3D11BlendState,
+    pub(crate) blur_blend_composite: ID3D11BlendState,
+    // The final scRGB pass while HDR output is on (see `HdrOutput`); same full-screen draw as the
+    // scene blit.
+    pub(crate) hdr_output_vertex: ID3D11VertexShader,
+    pub(crate) hdr_output_fragment: ID3D11PixelShader,
 }
 
 pub(crate) struct DirectXGlobalElements {
@@ -200,6 +335,8 @@ impl DirectXRenderer {
             fast_frame: crate::fast::frame::FrameState::default(),
             fast_composition: crate::fast::composition::DirectXComposition::default(),
             fast_recovery: crate::fast::device_recovery::RecoveryState::default(),
+            active_render_target: None,
+            hdr: HdrOutput::default(),
         })
     }
 
@@ -224,7 +361,14 @@ impl DirectXRenderer {
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
                 is_bgr: self.font_info.is_bgr as u32,
-                _pad: [0; 3],
+                // An SDR target has no headroom: HDR sprites are compressed into SDR.
+                hdr_headroom: if self.hdr.active {
+                    self.hdr.headroom
+                } else {
+                    1.0
+                },
+                hdr_output_scale: self.hdr_output_scale(),
+                _pad: 0,
             }],
         )?;
         unsafe {
@@ -336,6 +480,12 @@ impl DirectXRenderer {
         self.direct_composition = direct_composition;
         crate::fast::composition::recreate(self)?;
         self.skip_draws = true;
+        // The new swap chain is 8-bit; forgetting the request makes the app's next one re-probe
+        // the display and switch HDR back on.
+        self.hdr = HdrOutput {
+            headroom: self.hdr.headroom,
+            ..HdrOutput::default()
+        };
         Ok(())
     }
 
@@ -350,6 +500,9 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
+        if self.hdr.active {
+            self.log_hdr_diagnostics();
+        }
         self.present()
     }
 
@@ -364,15 +517,40 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         crate::fast::layers::raster::rasterize_tiles(self, scene)?;
-        self.pre_draw(&match background_appearance {
+        let clear_color = match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
-        })?;
+        };
+        self.pre_draw(&clear_color)?;
         self.upload_scene_buffers(scene)?;
-        if crate::fast::frame::draw_batches(self, scene)? {
-            return Ok(());
-        }
 
+        // [PiCell] Route through the offscreen scene texture when the scene contains blur
+        // filters, or always while HDR output is on (its final pass reads the scene from there);
+        // otherwise render straight to the swapchain exactly as before.
+        let filters =
+            crate::picell_filters::FilterTargets::begin(self, scene, self.hdr.active, clear_color)?;
+        self.fast_frame.picell_filters = filters;
+        let drawn = crate::fast::frame::draw_batches(self, scene);
+        let mut filters = self.fast_frame.picell_filters.take();
+        if !drawn? {
+            self.draw_batches_labeled(scene, &mut filters)?;
+        }
+        if let Some(filters) = filters {
+            filters.finish()?;
+        }
+        Ok(())
+    }
+
+    /// Upstream's batch loop, each batch inside a labeled event: what runs while a graphics
+    /// debugger such as PIX captures the frame, in place of gpui-fast's
+    /// (`fast::frame::draw_batches`).
+    fn draw_batches_labeled(
+        &mut self,
+        scene: &Scene,
+        filters: &mut Option<crate::picell_filters::FilterTargets>,
+    ) -> Result<()> {
+        // Paths restore to the target the batches draw into (see `draw_paths_to_intermediate`).
+        self.active_render_target = filters.as_ref().and_then(|f| f.current_rtv.clone());
         let annotation = self
             .devices
             .as_ref()
@@ -401,6 +579,18 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::BackdropFilters(range) => match filters.as_mut() {
+                    Some(filters) => filters.backdrop_filters(&scene.backdrop_filters[range]),
+                    None => Ok(()),
+                },
+                PrimitiveBatch::FilterBoundary(ix) => match filters.as_mut() {
+                    Some(filters) => {
+                        let result = filters.boundary(&scene.filter_boundaries[ix]);
+                        self.active_render_target = filters.current_rtv.clone();
+                        result
+                    }
+                    None => Ok(()),
+                },
             }
             .with_context(|| {
                 format!(
@@ -417,14 +607,16 @@ impl DirectXRenderer {
                 )
             })?;
         }
+        self.active_render_target = None;
         Ok(())
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
     /// the window need never be shown or visible (the macOS headless path
     /// goes through MetalRenderer; this is the Windows analogue). Draws into
-    /// the existing render target, copies it into a `D3D11_USAGE_STAGING`
-    /// texture, maps it, and converts BGRA to RGBA.
+    /// the existing render target, reads it back, and converts BGRA to RGBA —
+    /// or, while HDR output is on, undoes the scRGB pass so the image holds
+    /// what the 8-bit pipeline would (HDR highlights clipped to white).
     #[cfg(feature = "test-support")]
     pub(crate) fn render_to_image(
         &mut self,
@@ -440,62 +632,167 @@ impl DirectXRenderer {
         );
         self.render(scene, background_appearance)?;
 
+        let readback = self.read_back_render_target()?;
+        let (width, height) = (readback.width, readback.height);
+        let pixels = if self.hdr.active {
+            let scale = self.hdr_output_scale();
+            readback
+                .rgba_f32()
+                .chunks_exact(4)
+                .flat_map(|px| scrgb_to_srgb8(px, scale))
+                .collect()
+        } else {
+            // The render target is BGRA; image::RgbaImage expects RGBA.
+            let mut pixels = readback.bytes;
+            for px in pixels.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            pixels
+        };
+        image::RgbaImage::from_raw(width, height, pixels)
+            .context("Failed to build RgbaImage from staging readback")
+    }
+
+    /// A CPU copy of the swapchain's current back buffer.
+    fn read_back_render_target(&self) -> Result<TextureReadback> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let device = &devices.device;
-        let context = &devices.device_context;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        let render_target = resources
+        let render_target = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
             .render_target
             .as_ref()
             .context("render target missing")?;
+        read_back_texture(&devices.device, &devices.device_context, render_target)
+    }
 
-        // A CPU-readable copy of the render target.
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { render_target.GetDesc(&mut desc) };
-        let width = desc.Width;
-        let height = desc.Height;
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-            MipLevels: 1,
-            ArraySize: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..desc
-        };
-        let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
-        let staging = staging.context("creating staging texture")?;
-        unsafe { context.CopyResource(&staging, render_target) };
+    /// The scRGB value SDR white is drawn at while HDR output is on.
+    fn hdr_output_scale(&self) -> f32 {
+        self.hdr
+            .display
+            .map_or(1.0, |display| display.sdr_white_scale())
+    }
 
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
-        let row_bytes = (width as usize) * 4;
-        let mut pixels = vec![0u8; row_bytes * height as usize];
-        // SAFETY: `Map` succeeded, so `pData` points at `RowPitch * height`
-        // readable bytes for as long as the mapping is held, and `RowPitch >=
-        // row_bytes` (it only ever adds trailing padding). `pixels` is sized
-        // `row_bytes * height`, so every copy stays in bounds on both sides,
-        // and the regions cannot overlap (`pixels` is a fresh allocation).
-        unsafe {
-            let src = mapped.pData as *const u8;
-            for row in 0..height as usize {
-                let s = src.add(row * mapped.RowPitch as usize);
-                let d = pixels.as_mut_ptr().add(row * row_bytes);
-                std::ptr::copy_nonoverlapping(s, d, row_bytes);
+    /// Ask for HDR output (`enabled`) and report the display's current `headroom` (multiples of
+    /// SDR white) that HDR sprites are soft-clipped into. Called after every drawn frame, so it
+    /// mostly just stores the request; the display is re-read at most every
+    /// [`HDR_PROBE_INTERVAL`], and the swap chain is switched only when the outcome changes.
+    pub(crate) fn set_hdr_content(&mut self, enabled: bool, headroom: f32) {
+        self.hdr.headroom = headroom.max(1.0);
+        if enabled && !self.hdr.wanted {
+            // A fresh request: look at the display now and give a failed switch another chance.
+            self.hdr.failed = false;
+            self.hdr.last_probe = None;
+        }
+        self.hdr.wanted = enabled;
+        if enabled
+            && self
+                .hdr
+                .last_probe
+                .is_none_or(|probed| probed.elapsed() >= HDR_PROBE_INTERVAL)
+        {
+            self.hdr.display = self.probe_hdr_display();
+            self.hdr.last_probe = Some(Instant::now());
+        }
+
+        let active = enabled
+            && !self.hdr.failed
+            && self.hdr.display.is_some_and(|display| display.hdr_enabled);
+        if active == self.hdr.active {
+            return;
+        }
+        match self.switch_hdr_output(active) {
+            Ok(()) => log::info!(
+                "HDR output {}: {:?}, scRGB scale {:.3}",
+                if active { "on" } else { "off" },
+                self.hdr.display,
+                self.hdr_output_scale()
+            ),
+            Err(err) => {
+                log::warn!("Switching HDR output failed, staying SDR: {err:#}");
+                self.hdr.failed = true;
             }
-            context.Unmap(&staging, 0);
         }
-        // The render target is BGRA; image::RgbaImage expects RGBA.
-        for px in pixels.chunks_exact_mut(4) {
-            px.swap(0, 2);
+    }
+
+    fn probe_hdr_display(&mut self) -> Option<HdrDisplay> {
+        let stale = self
+            .hdr
+            .probe_factory
+            .as_ref()
+            .is_none_or(|factory| !unsafe { factory.IsCurrent() }.as_bool());
+        if stale {
+            self.hdr.probe_factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }
+                .context("Creating DXGI factory for the HDR display probe")
+                .log_err();
         }
-        image::RgbaImage::from_raw(width, height, pixels)
-            .context("Failed to build RgbaImage from staging readback")
+        hdr_display::probe(self.hdr.probe_factory.as_ref()?, self.hwnd)
+    }
+
+    /// Rebuild the swap chain buffers and scene targets in the format for `hdr`. A failed switch
+    /// to HDR still leaves a working 8-bit swap chain behind — it can fail after `ResizeBuffers`
+    /// already made the buffers FP16.
+    fn switch_hdr_output(&mut self, hdr: bool) -> Result<()> {
+        self.hdr.active = hdr;
+        let result = self.rebuild_swap_chain_buffers().and_then(|()| {
+            if hdr {
+                return Ok(());
+            }
+            // Back to the 8-bit swapchain's default colour space.
+            let resources = self.resources.as_ref().context("resources missing")?;
+            set_swap_chain_color_space(
+                &resources.swap_chain,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            )
+        });
+        if result.is_err() && hdr {
+            self.hdr.active = false;
+            self.rebuild_swap_chain_buffers()
+                .context("Restoring the SDR swap chain")
+                .log_err();
+        }
+        result
+    }
+
+    /// Statistics of the HDR swapchain, logged when [`HDR_DIAGNOSTICS_ENV`] is set.
+    fn log_hdr_diagnostics(&mut self) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os(HDR_DIAGNOSTICS_ENV).is_some())
+            || self
+                .hdr
+                .last_diagnostics
+                .is_some_and(|logged| logged.elapsed() < HDR_DIAGNOSTICS_INTERVAL)
+        {
+            return;
+        }
+        self.hdr.last_diagnostics = Some(Instant::now());
+        let Some(readback) = self.read_back_render_target().log_err() else {
+            return;
+        };
+        let scale = self.hdr_output_scale();
+        let rgba = readback.rgba_f32();
+        let (mut min, mut max, mut sum, mut above_white) = (f32::MAX, f32::MIN, 0.0f64, 0usize);
+        for px in rgba.chunks_exact(4) {
+            let peak = px[0].max(px[1]).max(px[2]);
+            min = min.min(px[0].min(px[1]).min(px[2]));
+            max = max.max(peak);
+            sum += (px[0] + px[1] + px[2]) as f64 / 3.0;
+            // A hair over SDR white, so rounding of UI white doesn't count.
+            if peak > scale * 1.01 {
+                above_white += 1;
+            }
+        }
+        let pixel_count = (rgba.len() / 4).max(1);
+        log::info!(
+            "HDR diagnostics {}x{}: scRGB min {min:.4} max {max:.4} mean {:.4}; SDR white {scale:.3} \
+             ({:.0} nits), {:.2}% of pixels brighter, headroom {:.2}",
+            readback.width,
+            readback.height,
+            sum / pixel_count as f64,
+            scale * hdr_display::SCRGB_WHITE_NITS,
+            above_white as f64 * 100.0 / pixel_count as f64,
+            self.hdr.headroom,
+        );
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -507,6 +804,19 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
         crate::fast::layers::release_tiles(self);
+        self.rebuild_swap_chain_buffers()
+    }
+
+    /// Recreate the swap chain buffers and every size- or format-dependent target for the current
+    /// size and HDR state. `ResizeBuffers` takes the format too, so switching HDR needs no new
+    /// swap chain.
+    fn rebuild_swap_chain_buffers(&mut self) -> Result<()> {
+        let (width, height) = (self.width, self.height);
+        let format = if self.hdr.active {
+            HDR_RENDER_TARGET_FORMAT
+        } else {
+            RENDER_TARGET_FORMAT
+        };
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -526,13 +836,20 @@ impl DirectXRenderer {
                     BUFFER_COUNT as u32,
                     width,
                     height,
-                    RENDER_TARGET_FORMAT,
+                    format,
                     DXGI_SWAP_CHAIN_FLAG(0),
                 )
                 .context("Failed to resize swap chain")?;
         }
+        if self.hdr.active {
+            // Re-applied after every resize — the buffers are new.
+            set_swap_chain_color_space(
+                &resources.swap_chain,
+                DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+            )?;
+        }
 
-        resources.recreate_resources(devices, width, height)?;
+        resources.recreate_resources(devices, width, height, format)?;
 
         unsafe {
             devices
@@ -684,10 +1001,16 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
+            // Restore the active render target (the offscreen scene/group target when blurring,
+            // otherwise the swapchain) so the path sprites land on the correct surface.
+            let restore_target = if self.active_render_target.is_some() {
+                &self.active_render_target
+            } else {
+                &resources.render_target_view
+            };
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
         }
 
         Ok(())
@@ -917,6 +1240,7 @@ impl DirectXResources {
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
+        let blur = BlurResources::new(&devices.device, width, height, RENDER_TARGET_FORMAT)?;
 
         Ok(Self {
             swap_chain,
@@ -926,16 +1250,19 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
+            blur,
             viewport,
         })
     }
 
+    /// `format` is the swap chain's, which the blur/scene targets follow.
     #[inline]
     fn recreate_resources(
         &mut self,
         devices: &DirectXRendererDevices,
         width: u32,
         height: u32,
+        format: DXGI_FORMAT,
     ) -> Result<()> {
         let (
             render_target,
@@ -952,6 +1279,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
+        self.blur = BlurResources::new(&devices.device, width, height, format)?;
         self.viewport = viewport;
         Ok(())
     }
@@ -1016,6 +1344,45 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
 
+        let blur_downsample_vertex = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::BlurDownsample, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let blur_downsample_fragment = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::BlurDownsample, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+        let blur_vertex = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::Blur, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let blur_fragment = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::Blur, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+        let blur_composite_vertex = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::BlurComposite, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let blur_composite_fragment = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::BlurComposite, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+        let blur_params_buffer =
+            create_constant_buffer_sized(device, crate::picell_filters::BLUR_PARAMS_SIZE)?;
+        let blur_blend_replace = create_blend_state_no_blend(device)?;
+        // Premultiplied (One / InvSrcAlpha) — the composite outputs a premultiplied blurred sample;
+        // straight-alpha blending would darken the faded edges.
+        let blur_blend_composite = create_blend_state_for_path_sprite(device)?;
+        let hdr_output_vertex = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::HdrOutput, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let hdr_output_fragment = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::HdrOutput, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
@@ -1025,6 +1392,17 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            blur_downsample_vertex,
+            blur_downsample_fragment,
+            blur_vertex,
+            blur_fragment,
+            blur_composite_vertex,
+            blur_composite_fragment,
+            blur_params_buffer,
+            blur_blend_replace,
+            blur_blend_composite,
+            hdr_output_vertex,
+            hdr_output_fragment,
         })
     }
 }
@@ -1091,8 +1469,15 @@ pub(crate) struct GlobalParams {
     pub(crate) grayscale_enhanced_contrast: f32,
     pub(crate) subpixel_enhanced_contrast: f32,
     pub(crate) is_bgr: u32,
-    pub(crate) _pad: [u32; 3],
+    /// Display headroom (multiples of SDR white) HDR sprites are soft-clipped into; 1.0 on an SDR
+    /// target.
+    pub(crate) hdr_headroom: f32,
+    /// scRGB value of SDR white for the HDR output pass.
+    pub(crate) hdr_output_scale: f32,
+    pub(crate) _pad: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<GlobalParams>() == 48);
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, align(16))]
@@ -1454,6 +1839,46 @@ pub(crate) fn create_path_intermediate_texture(
     Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
+/// Create a color texture usable as both a render target and a shader resource, returning both
+/// views. Used for the blur offscreen targets.
+#[inline]
+fn create_color_target(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<(
+    ID3D11Texture2D,
+    Option<ID3D11RenderTargetView>,
+    Option<ID3D11ShaderResourceView>,
+)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width.max(1),
+            Height: height.max(1),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+    let mut rtv = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+    let mut srv = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv))? };
+    Ok((texture, rtv, srv))
+}
+
 #[inline]
 pub(crate) fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
@@ -1588,6 +2013,39 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
     }
 }
 
+/// Create a CPU-writable dynamic constant buffer of the given byte size (rounded up to 16).
+#[inline]
+/// Creates a dynamic constant buffer sized at runtime.
+///
+/// Distinct from the generic [`create_constant_buffer`], which derives its size from a `T` known
+/// at compile time — the blur passes size their cbuffer from a plain byte count.
+fn create_constant_buffer_sized(device: &ID3D11Device, byte_size: usize) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: byte_size.next_multiple_of(16) as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    Ok(buffer.unwrap())
+}
+
+/// A blend state that overwrites the target (no blending) — used for the blur downsample and
+/// gaussian passes.
+#[inline]
+fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = false.into();
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
 #[inline]
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
     unsafe {
@@ -1652,7 +2110,7 @@ fn create_buffer_view(
 }
 
 #[inline]
-fn update_buffer<T>(
+pub(crate) fn update_buffer<T>(
     device_context: &ID3D11DeviceContext,
     buffer: &ID3D11Buffer,
     data: &[T],
@@ -1701,6 +2159,149 @@ fn set_pipeline_state(
     }
 }
 
+/// Select the colour space DXGI presents the swap chain in. Composition swap chains support this
+/// too (checked on Windows 11 with an FP16 one), so the support check is real, not a formality.
+fn set_swap_chain_color_space(
+    swap_chain: &IDXGISwapChain1,
+    color_space: DXGI_COLOR_SPACE_TYPE,
+) -> Result<()> {
+    let swap_chain: IDXGISwapChain3 = swap_chain.cast()?;
+    let support = unsafe { swap_chain.CheckColorSpaceSupport(color_space) }?;
+    anyhow::ensure!(
+        support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0,
+        "swap chain cannot present in colour space {color_space:?}"
+    );
+    unsafe { swap_chain.SetColorSpace1(color_space) }?;
+    Ok(())
+}
+
+/// A CPU copy of a texture's first mip, rows packed tight.
+struct TextureReadback {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    bytes: Vec<u8>,
+}
+
+impl TextureReadback {
+    /// Every channel as `f32`, in the texture's channel order (BGRA stays BGRA): 8-bit channels
+    /// over 255, half floats as stored.
+    fn rgba_f32(&self) -> Vec<f32> {
+        if self.format == HDR_RENDER_TARGET_FORMAT {
+            self.bytes
+                .chunks_exact(2)
+                .map(|half| half_to_f32(u16::from_le_bytes([half[0], half[1]])))
+                .collect()
+        } else {
+            self.bytes.iter().map(|&v| v as f32 / 255.0).collect()
+        }
+    }
+}
+
+/// Copy `texture` through a `D3D11_USAGE_STAGING` texture into CPU memory.
+fn read_back_texture(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+) -> Result<TextureReadback> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    let width = desc.Width;
+    let height = desc.Height;
+    let bytes_per_pixel = if desc.Format == HDR_RENDER_TARGET_FORMAT {
+        8
+    } else {
+        4
+    };
+    let staging_desc = D3D11_TEXTURE2D_DESC {
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+        MipLevels: 1,
+        ArraySize: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        ..desc
+    };
+    let mut staging: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
+    let staging = staging.context("creating staging texture")?;
+    unsafe { context.CopyResource(&staging, texture) };
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    let row_bytes = width as usize * bytes_per_pixel;
+    let mut bytes = vec![0u8; row_bytes * height as usize];
+    // SAFETY: `Map` succeeded, so `pData` points at `RowPitch * height`
+    // readable bytes for as long as the mapping is held, and `RowPitch >=
+    // row_bytes` (it only ever adds trailing padding). `bytes` is sized
+    // `row_bytes * height`, so every copy stays in bounds on both sides,
+    // and the regions cannot overlap (`bytes` is a fresh allocation).
+    unsafe {
+        let src = mapped.pData as *const u8;
+        for row in 0..height as usize {
+            let s = src.add(row * mapped.RowPitch as usize);
+            let d = bytes.as_mut_ptr().add(row * row_bytes);
+            std::ptr::copy_nonoverlapping(s, d, row_bytes);
+        }
+        context.Unmap(&staging, 0);
+    }
+    Ok(TextureReadback {
+        width,
+        height,
+        format: desc.Format,
+        bytes,
+    })
+}
+
+/// One premultiplied scRGB pixel (RGBA, SDR white at `scale`) back to the premultiplied sRGB
+/// bytes the 8-bit pipeline would have drawn — the inverse of `hdr_output_fragment`, with HDR
+/// highlights clipped to white.
+#[cfg(feature = "test-support")]
+fn scrgb_to_srgb8(px: &[f32], scale: f32) -> [u8; 4] {
+    let alpha = px[3].clamp(0.0, 1.0);
+    let encode = |linear_premultiplied: f32| {
+        if alpha <= 0.0 {
+            return 0;
+        }
+        let linear = (linear_premultiplied / (scale * alpha)).clamp(0.0, 1.0);
+        let encoded = if linear <= 0.0031308 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * alpha * 255.0).round() as u8
+    };
+    [
+        encode(px[0]),
+        encode(px[1]),
+        encode(px[2]),
+        (alpha * 255.0).round() as u8,
+    ]
+}
+
+/// IEEE 754 binary16 → f32 (no `half` dependency; readback only).
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let f = match exp {
+        0 => (frac as f32) * 2f32.powi(-24),
+        0x1f => {
+            if frac == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15),
+    };
+    if sign == 1 { -f } else { f }
+}
+
 #[cfg(debug_assertions)]
 fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     let debug_device: ID3D11Debug = device.cast()?;
@@ -1734,6 +2335,10 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        BlurDownsample,
+        Blur,
+        BlurComposite,
+        HdrOutput,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1806,6 +2411,22 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::BlurDownsample => match target {
+                    ShaderTarget::Vertex => BLUR_DOWNSAMPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLUR_DOWNSAMPLE_FRAGMENT_BYTES,
+                },
+                ShaderModule::Blur => match target {
+                    ShaderTarget::Vertex => BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLUR_FRAGMENT_BYTES,
+                },
+                ShaderModule::BlurComposite => match target {
+                    ShaderTarget::Vertex => BLUR_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLUR_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::HdrOutput => match target {
+                    ShaderTarget::Vertex => HDR_OUTPUT_VERTEX_BYTES,
+                    ShaderTarget::Fragment => HDR_OUTPUT_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1888,6 +2509,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::BlurDownsample => "blur_downsample",
+                ShaderModule::Blur => "blur",
+                ShaderModule::BlurComposite => "blur_composite",
+                ShaderModule::HdrOutput => "hdr_output",
             }
         }
     }

@@ -283,6 +283,10 @@ fn encode(
                 surface_textures,
             )?,
             PrimitiveBatch::SubpixelSprites { .. } => unreachable!("Metal uses grayscale glyphs"),
+            // [PiCell] TODO(mac): blur filters inside a frame with rounded clip groups are not
+            // drawn yet — the passes live in upstream's loop (`MetalRenderer`), which this one
+            // replaces for such a frame.
+            PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => {}
         }
     }
     Ok(encoder)

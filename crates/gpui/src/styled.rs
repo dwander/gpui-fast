@@ -1,8 +1,8 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+    DefiniteLength, Display, Fill, Filter, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    Pixels, Point, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -32,6 +32,87 @@ pub trait Styled: Sized {
     gpui_macros::cursor_style_methods!();
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
+
+    /// Blur this element's own content and children, like CSS `filter: blur(<radius>)`.
+    ///
+    /// This isolates the element's subtree, blurs it as a group, and composites the
+    /// result back. To blur the content *behind* the element instead (frosted glass),
+    /// use [`Styled::backdrop_blur`].
+    ///
+    /// *Appends* to the element's filter chain, so it composes with other convenience
+    /// setters (`.blur(8.).<other_filter>()`). To replace the whole chain, use
+    /// [`Styled::filter`].
+    fn blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.style()
+            .filter
+            .get_or_insert_with(Vec::new)
+            .push(Filter::Blur(radius.into()));
+        self
+    }
+
+    /// Set (replacing any existing) the full list of filters applied to this element's own
+    /// content, like CSS `filter`. To add a single filter to the chain instead, use the
+    /// convenience setters such as [`Styled::blur`].
+    fn filter(mut self, filters: impl Into<Vec<Filter>>) -> Self {
+        self.style().filter = Some(filters.into());
+        self
+    }
+
+    /// Blur the content rendered behind this element — a frosted-glass effect — like CSS
+    /// `backdrop-filter: blur(<radius>)`. Typically paired with a translucent [`Styled::bg`]
+    /// so the background tints the blurred backdrop.
+    ///
+    /// *Appends* to the element's backdrop-filter chain. To replace the whole chain, use
+    /// [`Styled::backdrop_filter`].
+    fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.style()
+            .backdrop_filter
+            .get_or_insert_with(Vec::new)
+            .push(Filter::Blur(radius.into()));
+        self
+    }
+
+    /// Set (replacing any existing) the full list of filters applied to the content behind this
+    /// element, like CSS `backdrop-filter`. To add a single filter to the chain instead, use the
+    /// convenience setters such as [`Styled::backdrop_blur`].
+    fn backdrop_filter(mut self, filters: impl Into<Vec<Filter>>) -> Self {
+        self.style().backdrop_filter = Some(filters.into());
+        self
+    }
+
+    /// Scale this element and its children, like CSS `transform: scale(<factor>)`. Animate it
+    /// from a value below 1 up to 1 to make a menu, popover or dialog grow as it appears. It
+    /// scales about the element's center unless [`Styled::appear_scale_origin`] says otherwise.
+    ///
+    /// This is a *raster* scale, exactly like a CSS transform: the element's subtree is rendered
+    /// once at its laid-out size and then resampled, so it does not reflow, and permanently
+    /// magnifying an element this way makes it blurry. Its shadow and backdrop filter are scaled
+    /// geometrically to match. Two things intentionally do *not* scale:
+    ///
+    /// - **Layout.** The element still occupies its full, unscaled size; siblings do not move.
+    /// - **Hit testing.** Mouse bounds stay unscaled, so a control does not become unclickable
+    ///   part-way through its entrance animation.
+    ///
+    /// A factor other than 1 isolates the subtree into an offscreen group (as [`Styled::blur`]
+    /// does), which costs a render target and a composite pass — hence the transient,
+    /// appear/disappear-shaped use it is named for.
+    fn appear_scale(mut self, factor: f32) -> Self {
+        self.style().appear_scale = Some(factor);
+        self
+    }
+
+    /// The point [`Styled::appear_scale`] scales about, as a fraction of the element's own size —
+    /// `point(0., 0.)` is its top left corner, `point(1., 1.)` its bottom right, and the default
+    /// `point(0.5, 0.5)` its center. This is CSS `transform-origin`.
+    ///
+    /// Anchor a growing menu at the corner its trigger is attached to and it appears to unfold
+    /// out of the button rather than to inflate in place; [`Anchor::origin_fraction`] converts
+    /// the anchor an [`crate::anchored`] element already uses. Values outside `0..=1` are allowed
+    /// and place the origin outside the element.
+    fn appear_scale_origin(mut self, origin: Point<f32>) -> Self {
+        self.style().appear_scale_origin = Some(origin);
+        self
+    }
 
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
@@ -499,6 +580,20 @@ pub trait Styled: Sized {
     /// Sets the border style of the element.
     fn border_dashed(mut self) -> Self {
         self.style().border_style = Some(BorderStyle::Dashed);
+        self
+    }
+
+    /// Sets the length of each border dash, as a multiple of the border width.
+    /// Defaults to 2. Only used when the border style is dashed.
+    fn border_dashed_length(mut self, length_per_border_width: f32) -> Self {
+        self.style().border_dashed_length = Some(length_per_border_width.max(0.));
+        self
+    }
+
+    /// Sets the gap between border dashes, as a multiple of the border width.
+    /// Defaults to 1. Only used when the border style is dashed.
+    fn border_dashed_gap(mut self, gap_per_border_width: f32) -> Self {
+        self.style().border_dashed_gap = Some(gap_per_border_width.max(0.));
         self
     }
 

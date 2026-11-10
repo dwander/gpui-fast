@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
-    sync::{Arc, Once, atomic::AtomicBool},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -58,10 +61,22 @@ pub struct WindowsWindowState {
     pub(crate) fast_frame_request: Arc<crate::fast::frame_schedule::FrameRequest>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
+    /// Last caret rectangle reported to the OS, in physical client coordinates.
+    /// Used to skip the IME/caret updates while the caret hasn't moved.
+    pub(crate) last_caret: Cell<Option<CaretRect>>,
+    /// Size and blank bitmap of the invisible system caret, while one exists.
+    /// See `WindowsWindowInner::show_system_caret`.
+    pub(crate) system_caret: Cell<Option<(CaretRect, HBITMAP)>>,
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    /// Whether the last drawn frame had an element under the cursor that accepts the drag now
+    /// hovering this window. Written by GPUI once per frame while a drag is in flight, read by
+    /// [`WindowsDragDropHandler`] to pick the drop effect (see [`hover_drop_effect`]).
+    /// `None` until the first frame is drawn with the drag in hand — `DragEnter` clears it, and
+    /// "don't know yet" must not be read as a refusal.
+    pub drop_target_hovered: Cell<Option<bool>>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
 
@@ -110,6 +125,10 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    /// Set on `WM_DESTROY`. When the OS destroys the window (close button,
+    /// Alt+F4, owner destroyed) the `WindowsWindow` is dropped afterwards, and
+    /// its handle no longer names a window.
+    pub(crate) destroyed: Cell<bool>,
 }
 
 impl WindowsWindowState {
@@ -177,10 +196,13 @@ impl WindowsWindowState {
             fast_frame_request,
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
+            last_caret: Cell::new(None),
+            system_caret: Cell::new(None),
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            drop_target_hovered: Cell::new(None),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
@@ -304,6 +326,7 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            destroyed: Cell::new(false),
         }))
     }
 
@@ -467,17 +490,25 @@ impl WindowsWindow {
             draw_coordinator,
         } = creation_info;
         register_window_class(icon);
+        // Owner window. `Floating` and `Dialog` are both documented to sit above their parent, so
+        // hand the active window to `CreateWindowExW` as the owner. Neither style sets `WS_CHILD`,
+        // so this creates an ownership relation, not a parent/child one: the window keeps its own
+        // taskbar button (`WS_EX_APPWINDOW`) but can no longer be buried behind its owner.
+        let owner_hwnd = if matches!(params.kind, WindowKind::Floating | WindowKind::Dialog) {
+            let active_window = unsafe { GetActiveWindow() };
+            (!active_window.is_invalid()).then_some(active_window)
+        } else {
+            None
+        };
+        // Only `Dialog` is modal: disable the owner's input until this window is destroyed.
+        // `Floating` deliberately leaves the owner clickable, it just stays on top of it.
         let parent_hwnd = if params.kind == WindowKind::Dialog {
-            let parent_window = unsafe { GetActiveWindow() };
-            if parent_window.is_invalid() {
-                None
-            } else {
-                // Disable the parent window to make this dialog modal
+            if let Some(parent_window) = owner_hwnd {
                 unsafe {
                     EnableWindow(parent_window, false).as_bool();
                 };
-                Some(parent_window)
             }
+            owner_hwnd
         } else {
             None
         };
@@ -562,7 +593,7 @@ impl WindowsWindow {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                parent_hwnd,
+                owner_hwnd,
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -617,21 +648,30 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
         self.0.dialog_owner.close();
+        // Already destroyed by the OS: nothing left to hide or destroy, and the
+        // drop target was revoked in `WM_DESTROY`.
+        if self.0.destroyed.get() {
+            return;
+        }
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
         // resulting visibility report has nothing to notify.
         self.0.state.callbacks.visibility_change.take();
+        // Hiding an active window deactivates it, and that report would reach
+        // the app after the window is already gone from it.
+        self.0.state.callbacks.active_status_change.take();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
             .executor
             .spawn(async move {
                 this.dialog_owner.when_idle().await;
-                let handle = this.hwnd;
-                unsafe {
-                    RevokeDragDrop(handle).log_err();
-                    DestroyWindow(handle).log_err();
+                // The OS may have destroyed it while we waited (e.g. its owner closed).
+                if this.destroyed.get() {
+                    return;
                 }
+                // `WM_DESTROY` revokes the drop target.
+                unsafe { DestroyWindow(this.hwnd).log_err() };
             })
             .detach();
     }
@@ -683,6 +723,34 @@ impl PlatformWindow for WindowsWindow {
             .detach();
     }
 
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        let hwnd = self.0.hwnd;
+        let bounds = bounds.to_device_pixels(self.scale_factor());
+        // The border offset lives outside the logical bounds, so position and size both come
+        // from the adjusted rect -- passing `bounds.origin` here would shift the window by
+        // half the border on every call.
+        let rect = calculate_window_rect(bounds, &self.state.border_offset);
+
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .context("unable to set window bounds")
+                    .log_err();
+                }
+            })
+            .detach();
+    }
+
     fn scale_factor(&self) -> f32 {
         self.state.scale_factor.get()
     }
@@ -696,6 +764,12 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
+        // Deferred callbacks (the deactivation sent while the window is being
+        // destroyed) can still ask after destruction; the handle can no longer
+        // convert coordinates, so answer with the last known position.
+        if self.0.destroyed.get() {
+            return self.state.mouse_position.get();
+        }
         let scale_factor = self.scale_factor();
         let point = unsafe {
             let mut point: POINT = std::mem::zeroed();
@@ -953,7 +1027,18 @@ impl PlatformWindow for WindowsWindow {
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
-                ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
+                // `zoom` is a *toggle* (matching `NSWindow::zoom_`, which the macOS backend
+                // forwards to), so restore when the window is already zoomed. Without this,
+                // `Window::zoom_window` can only ever maximize on Windows, and an app that
+                // calls it to un-maximize silently does nothing.
+                // (The caption buttons are unaffected either way -- Windows itself handles
+                // those through the non-client hit test, never through this method.)
+                let cmd = if IsZoomed(self.0.hwnd).as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                ShowWindowAsync(self.0.hwnd, cmd).ok().log_err();
             } else if let Some(mut status) = self.state.initial_placement.take() {
                 status.state = WindowOpenState::Maximized;
                 self.state.initial_placement.set(Some(status));
@@ -1073,6 +1158,13 @@ impl PlatformWindow for WindowsWindow {
         crate::fast::composition::set_composition_order(self, surfaces)
     }
 
+    fn set_hdr_content(&self, enabled: bool, headroom: f32) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .set_hdr_content(enabled, headroom);
+    }
+
     #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state
@@ -1091,6 +1183,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    fn set_drop_target_hovered(&self, hovered: bool) {
+        self.state.drop_target_hovered.set(Some(hovered));
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -1173,6 +1269,75 @@ impl accesskit::ActionHandler for A11yActionHandler {
     }
 }
 
+/// What a modifier-free drop means to the host app: `true` = move, `false` = copy. Cosmetic only —
+/// it picks the badge shown on the drag cursor (see [`hover_drop_effect`]) so the feedback matches
+/// what the app will actually do. It can't move data: [`commit_drop_effect`] never reports `MOVE`.
+static DRAG_MOVE_IS_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// Sets what a modifier-free drop means to the host app, so the drag cursor's badge agrees with it.
+/// Apps that treat a plain drop as a copy (the default) never need to call this.
+pub fn set_drag_move_is_default(is_move: bool) {
+    DRAG_MOVE_IS_DEFAULT.store(is_move, Ordering::Relaxed);
+}
+
+/// Drop effect to show while hovering (`DragEnter`/`DragOver`) — cosmetic feedback that drives the
+/// drag source's cursor/badge via `GiveFeedback`.
+///
+/// `accepted` is what the last drawn frame found under the cursor
+/// ([`PlatformWindow::set_drop_target_hovered`]): with nothing willing to take the drag we report
+/// `NONE` so the OS shows the "not allowed" cursor over dead space, rather than promising a drop
+/// that would quietly do nothing. `None` means no frame has been drawn since the drag arrived, and
+/// is treated as acceptable — guessing "refused" there would flash the "not allowed" cursor at the
+/// edge of every window and throw away a drop released in those first milliseconds, since OLE turns
+/// a `NONE` hover into `DragLeave` instead of `Drop`. Nothing is lost by the optimism: only
+/// [`commit_drop_effect`] can move data, and it stays conservative.
+///
+/// Where a drop *is* accepted the badge follows the Windows convention — Ctrl copies, Shift moves,
+/// and a bare drop does whatever the host app calls its default ([`set_drag_move_is_default`]) —
+/// regardless of where the drag came from. The source's allowed effects still bound that choice:
+/// a copy-only source must never be shown a move cursor.
+fn hover_drop_effect(
+    accepted: Option<bool>,
+    grfkeystate: MODIFIERKEYS_FLAGS,
+    allowed: DROPEFFECT,
+) -> DROPEFFECT {
+    // This target commits only COPY, even when the app performs an internal move itself.
+    if accepted == Some(false) || allowed.0 & DROPEFFECT_COPY.0 == 0 {
+        DROPEFFECT_NONE
+    } else if (grfkeystate & MK_CONTROL).0 != 0 {
+        DROPEFFECT_COPY
+    } else if (grfkeystate & MK_SHIFT).0 != 0 && allowed.0 & DROPEFFECT_MOVE.0 != 0 {
+        DROPEFFECT_MOVE
+    } else if DRAG_MOVE_IS_DEFAULT.load(Ordering::Relaxed)
+        && allowed.0 & DROPEFFECT_MOVE.0 != 0
+    {
+        DROPEFFECT_MOVE
+    } else {
+        DROPEFFECT_COPY
+    }
+}
+
+/// Drop effect to commit at `Drop` — what the (possibly external) drag source's own `DoDragDrop`
+/// call sees as the final outcome of the whole drag. For shell `IDataObject`/`CF_HDROP` drags,
+/// `MOVE` tells the **source** to delete its own originals.
+///
+/// This window never claims a move. A drop our own handlers took is completed by the app itself
+/// (it copies, then deletes the source), and a drop nothing took must leave the source untouched —
+/// so reporting `MOVE` could only ever destroy data that no one received. It used to be reported
+/// for in-app drags with Shift held, which meant a Shift-drop onto any region without a drop
+/// handler (the preview, a side panel) permanently deleted the dragged files.
+///
+/// `COPY` only when the last drawn frame has not refused the drop and the source permits copying;
+/// otherwise `NONE`. Neither can cost the source its originals. Note that a hover effect of `NONE`
+/// makes OLE skip `Drop` entirely and call `DragLeave` instead, so dead space cancels the drag.
+fn commit_drop_effect(accepted: Option<bool>, allowed: DROPEFFECT) -> DROPEFFECT {
+    if accepted == Some(false) || allowed.0 & DROPEFFECT_COPY.0 == 0 {
+        DROPEFFECT_NONE
+    } else {
+        DROPEFFECT_COPY
+    }
+}
+
 #[implement(IDropTarget)]
 struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
@@ -1190,7 +1355,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     fn DragEnter(
         &self,
         pdataobj: windows::core::Ref<IDataObject>,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
@@ -1205,7 +1370,11 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY;
+                // GPUI hasn't drawn a frame with this drag yet, and whatever the flag holds
+                // describes an older one. Clear it so the effect stays optimistic until a frame
+                // reports on *this* drag (see `hover_drop_effect`).
+                self.0.state.drop_target_hovered.set(None);
+                *pdweffect = hover_drop_effect(None, grfkeystate, *pdweffect);
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());
                 };
@@ -1247,13 +1416,17 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
 
     fn DragOver(
         &self,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            *pdweffect = hover_drop_effect(
+                self.0.state.drop_target_hovered.get(),
+                grfkeystate,
+                *pdweffect,
+            );
             self.0
                 .drop_target_helper
                 .DragOver(&cursor_position, *pdweffect)
@@ -1295,7 +1468,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            *pdweffect = commit_drop_effect(self.0.state.drop_target_hovered.get(), *pdweffect);
             self.0
                 .drop_target_helper
                 .Drop(idata_obj, &cursor_position, *pdweffect)
@@ -1717,9 +1890,33 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
+    use super::{ClickState, commit_drop_effect, hover_drop_effect};
     use gpui::{DevicePixels, MouseButton, point};
     use std::time::Duration;
+    use windows::Win32::System::Ole::{
+        DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
+    };
+    use windows::Win32::System::SystemServices::MK_SHIFT;
+
+    #[test]
+    fn drop_effect_stays_within_source_permissions() {
+        let copy_only = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_LINK.0);
+        let copy_or_move = DROPEFFECT(copy_only.0 | DROPEFFECT_MOVE.0);
+        assert_eq!(
+            hover_drop_effect(Some(true), MK_SHIFT, copy_only).0,
+            DROPEFFECT_COPY.0
+        );
+        assert_eq!(
+            hover_drop_effect(Some(true), MK_SHIFT, copy_or_move).0,
+            DROPEFFECT_MOVE.0
+        );
+        assert_eq!(
+            hover_drop_effect(Some(false), MK_SHIFT, copy_only).0,
+            DROPEFFECT_NONE.0
+        );
+        assert_eq!(commit_drop_effect(Some(true), copy_only).0, DROPEFFECT_COPY.0);
+        assert_eq!(commit_drop_effect(Some(true), DROPEFFECT_MOVE).0, DROPEFFECT_NONE.0);
+    }
 
     #[test]
     fn test_double_click_interval() {

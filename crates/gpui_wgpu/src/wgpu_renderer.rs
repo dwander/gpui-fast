@@ -1639,6 +1639,11 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Filters (`filter` / `backdrop-filter`) are implemented by the DirectX and
+                    // Metal backends only. Here they draw nothing, so a blurred element renders
+                    // unblurred rather than failing — the element's own background and children
+                    // still paint normally.
+                    PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => {}
                 }
             }
         }
@@ -2836,14 +2841,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 42 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
     }
 
     #[test]
@@ -2851,6 +2856,8 @@ mod tests {
         let quad = Quad {
             order: 41,
             border_style: BorderStyle::Dashed,
+            border_dashed_length: 34.0,
+            border_dashed_gap: 35.0,
             bounds: Bounds {
                 origin: Point {
                     x: 1.0.into(),
@@ -2922,6 +2929,8 @@ mod tests {
             &[
                 41,
                 1,
+                34.0_f32.to_bits(),
+                35.0_f32.to_bits(),
                 1.0_f32.to_bits(),
                 2.0_f32.to_bits(),
                 3.0_f32.to_bits(),

@@ -11,11 +11,11 @@ use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
     Action, ActivationPolicy, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem,
-    CursorStyle, ForegroundExecutor, GraphicalEnvironment, KeyContext, Keymap, Menu, MenuItem,
-    OsMenu, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, SystemMenuType,
-    Task, ThermalState, WindowAppearance, WindowKind, WindowParams, WindowingRequest,
-    popup::PopupNotSupportedError,
+    CursorStyle, CustomCursorImage, ForegroundExecutor, GraphicalEnvironment, KeyContext, Keymap,
+    Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode,
+    Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind, WindowParams,
+    WindowingRequest, popup::PopupNotSupportedError,
 };
 use gpui_apple::{
     keychain,
@@ -34,7 +34,8 @@ use objc2_app_kit::{
     NSAppearanceNameVibrantLight, NSApplication, NSApplicationActivationPolicy,
     NSControlStateValueOn, NSCursor, NSDocumentController, NSEventModifierFlags, NSMenu,
     NSMenuItem, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSSavePanel, NSScroller,
-    NSScrollerStyle, NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
+    NSScrollerStyle, NSWindowLevel, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSBundle, NSError, NSInteger, NSProcessInfo, NSString, NSURL,
@@ -504,6 +505,23 @@ impl MacPlatform {
     }
 }
 
+/// 파일 선택/저장 패널을 앱의 **항상 위** 창보다 앞으로 올린다.
+///
+/// `beginWithCompletionHandler:` 로 띄운 패널은 앱 모달이 아니라 모달리스 창이라 기본
+/// 레벨(`NSNormalWindowLevel` = 0)에 놓인다. 앱이 [`WindowKind::Floating`](gpui::WindowKind)
+/// 창(레벨 3)을 띄워 둔 상태면 패널이 **그 뒤에 깔려** 사용자 눈에는 아무 일도 일어나지
+/// 않은 것처럼 보인다. 모달 패널 레벨로 올려 어떤 경우에도 앞에 오게 한다.
+///
+/// 레벨이 앱 밖에도 걸린다는 게 대가다 — 패널을 연 채 다른 앱으로 가면 그 앱의 창 위에 남아
+/// 화면을 가린다(패널은 비활성화에 숨지 않는다). 그래서 앱의 플로팅 창(`NSPanel` 기본값)처럼
+/// 비활성인 동안은 숨기고, 돌아오면 그 자리에 다시 보이게 한다.
+fn raise_panel_above_floating_windows(panel: &NSSavePanel) {
+    // NSModalPanelWindowLevel — 플로팅 창(3)보다 위, 팝업(101)보다 아래.
+    const NS_MODAL_PANEL_WINDOW_LEVEL: NSWindowLevel = 8;
+    panel.setLevel(NS_MODAL_PANEL_WINDOW_LEVEL);
+    panel.setHidesOnDeactivate(true);
+}
+
 impl Platform for MacPlatform {
     fn platform_info(&self) -> gpui::PlatformInfo {
         gpui::PlatformInfo {
@@ -866,6 +884,15 @@ impl Platform for MacPlatform {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.prompt_for_paths_in(options, None)
+    }
+
+    fn prompt_for_paths_in(
+        &self,
+        options: PathPromptOptions,
+        directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        let directory_url = directory.as_deref().and_then(NSURL::from_directory_path);
         let (done_tx, done_rx) = oneshot::channel();
         self.foreground_executor()
             .spawn(async move {
@@ -887,6 +914,10 @@ impl Platform for MacPlatform {
 
                 panel.setCanCreateDirectories(true);
                 panel.setResolvesAliases(false);
+
+                if let Some(directory_url) = directory_url.as_deref() {
+                    panel.setDirectoryURL(Some(directory_url));
+                }
 
                 let done_tx = Cell::new(Some(done_tx));
                 let handler = RcBlock::new({
@@ -912,6 +943,7 @@ impl Platform for MacPlatform {
                     panel.setPrompt(Some(&NSString::from_str(prompt.as_str())));
                 }
 
+                raise_panel_above_floating_windows(&panel);
                 panel.beginWithCompletionHandler(&handler);
             })
             .detach();
@@ -992,6 +1024,7 @@ impl Platform for MacPlatform {
                     }
                 });
 
+                raise_panel_above_floating_windows(&panel);
                 panel.beginWithCompletionHandler(&handler);
             })
             .detach();
@@ -1185,6 +1218,13 @@ impl Platform for MacPlatform {
         unsafe {
             set_active_window_cursor_style(style);
         }
+    }
+
+    fn register_custom_cursor(&self, image: &CustomCursorImage) -> CursorStyle {
+        // RGBA → NSCursor 등록 (메인 스레드). 실패 시 화살표 폴백.
+        crate::custom_cursor::register(image)
+            .map(CursorStyle::Custom)
+            .unwrap_or(CursorStyle::Arrow)
     }
 
     fn hide_cursor_until_mouse_moves(&self) {

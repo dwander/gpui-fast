@@ -2289,6 +2289,32 @@ impl Anchor {
         }
     }
 
+    /// Where this reference point sits inside a box, as a fraction of the box's size —
+    /// `(0, 0)` is the top left corner and `(1, 1)` the bottom right. Handy for the
+    /// fractional origins that [`crate::Styled::appear_scale_origin`] takes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{Anchor, point};
+    /// assert_eq!(Anchor::TopRight.origin_fraction(), point(1., 0.));
+    /// assert_eq!(Anchor::BottomCenter.origin_fraction(), point(0.5, 1.));
+    /// ```
+    #[must_use]
+    pub fn origin_fraction(self) -> Point<f32> {
+        let (x, y) = match self {
+            Anchor::TopLeft => (0., 0.),
+            Anchor::TopRight => (1., 0.),
+            Anchor::BottomLeft => (0., 1.),
+            Anchor::BottomRight => (1., 1.),
+            Anchor::TopCenter => (0.5, 0.),
+            Anchor::BottomCenter => (0.5, 1.),
+            Anchor::LeftCenter => (0., 0.5),
+            Anchor::RightCenter => (1., 0.5),
+        };
+        point(x, y)
+    }
+
     /// Returns whether the anchor is center-positioned.
     #[inline]
     pub fn is_center(&self) -> bool {

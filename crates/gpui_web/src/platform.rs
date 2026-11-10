@@ -590,6 +590,8 @@ impl Platform for WebPlatform {
             CursorStyle::DragLink => "alias",
             CursorStyle::DragCopy => "copy",
             CursorStyle::ContextualMenu => "context-menu",
+            // 커스텀 이미지 커서는 아직 web 미구현 → 기본 커서 폴백.
+            CursorStyle::Custom(_) => "default",
         };
 
         self.last_cursor_css.set(css_cursor);

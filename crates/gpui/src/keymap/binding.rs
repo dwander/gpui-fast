@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::{
     Action, AsKeystroke, DummyKeyboardMapper, InvalidKeystrokeError, KeyBindingContextPredicate,
-    KeybindingKeystroke, Keystroke, PlatformKeyboardMapper, SharedString,
+    KeybindingKeystroke, Keystroke, OperatingSystem, PlatformKeyboardMapper, SharedString,
 };
 use smallvec::SmallVec;
 
@@ -64,6 +64,30 @@ impl KeyBinding {
             action_input,
             cx.keyboard_mapper().as_ref(),
             |source| Keystroke::parse_with_os(source, cx.platform_info().os),
+        )
+    }
+
+    /// Load a keybinding from raw data with an explicit keyboard mapper and host OS.
+    ///
+    /// Same as [`Self::load`], but usable without an `App` — for building keymaps in plain
+    /// logic and unit tests from dynamic (user-configured) keystroke strings.
+    pub fn load_with(
+        keystrokes: &str,
+        action: Box<dyn Action>,
+        context_predicate: Option<Rc<KeyBindingContextPredicate>>,
+        use_key_equivalents: bool,
+        action_input: Option<SharedString>,
+        keyboard_mapper: &dyn PlatformKeyboardMapper,
+        os: OperatingSystem,
+    ) -> std::result::Result<Self, InvalidKeystrokeError> {
+        Self::load_internal(
+            keystrokes,
+            action,
+            context_predicate,
+            use_key_equivalents,
+            action_input,
+            keyboard_mapper,
+            |source| Keystroke::parse_with_os(source, os),
         )
     }
 

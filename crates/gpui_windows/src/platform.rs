@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::{OsStr, OsString},
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
@@ -93,6 +94,9 @@ pub(crate) struct WindowsPlatformState {
     jump_list: RefCell<JumpList>,
     // NOTE: standard cursor handles don't need to close.
     pub(crate) current_cursor: Cell<Option<HCURSOR>>,
+    /// Registered custom image cursors (id → source image + per-DPI HCURSOR), kept for the app lifetime.
+    pub(crate) custom_cursors: RefCell<HashMap<u32, CustomCursor>>,
+    custom_cursor_next_id: Cell<u32>,
     /// Shared with each window so `WM_SETCURSOR` can read it directly.
     pub(crate) cursor_visible: Arc<AtomicBool>,
     /// Shared with each window to coordinate draws across windows on the UI
@@ -127,6 +131,8 @@ impl WindowsPlatformState {
             callbacks,
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
+            custom_cursors: RefCell::new(HashMap::new()),
+            custom_cursor_next_id: Cell::new(0),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
@@ -300,7 +306,10 @@ impl WindowsPlatform {
             .read()
             .iter()
             .for_each(|handle| unsafe {
-                PostMessageW(Some(handle.as_raw()), message, wparam, lparam).log_err();
+                // Skip a window destroyed but not yet untracked.
+                if IsWindow(Some(handle.as_raw())).as_bool() {
+                    PostMessageW(Some(handle.as_raw()), message, wparam, lparam).log_err();
+                }
             });
     }
 
@@ -480,6 +489,11 @@ impl WindowsPlatform {
                             continue;
                         }
                         unsafe {
+                            // Destroyed, but not yet untracked (that waits for
+                            // `WM_GPUI_CLOSE_ONE_WINDOW` on the main thread).
+                            if !IsWindow(Some(hwnd.as_raw())).as_bool() {
+                                continue;
+                            }
                             if let Some(signal_at) = signal_at {
                                 if IsWindowVisible(hwnd.as_raw()).as_bool()
                                     && !IsIconic(hwnd.as_raw()).as_bool()
@@ -802,12 +816,20 @@ impl Platform for WindowsPlatform {
         &self,
         options: PathPromptOptions,
     ) -> Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.prompt_for_paths_in(options, None)
+    }
+
+    fn prompt_for_paths_in(
+        &self,
+        options: PathPromptOptions,
+        directory: Option<PathBuf>,
+    ) -> Receiver<Result<Option<Vec<PathBuf>>>> {
         let owner = self
             .find_current_active_window()
             .and_then(|hwnd| self.window_from_hwnd(hwnd))
             .map(|window| window.dialog_owner.clone());
         crate::dialog::show_dialog(owner, &self.foreground_executor, move |window| {
-            file_open_dialog(options, Some(window))
+            file_open_dialog(options, directory, Some(window))
         })
     }
 
@@ -1005,7 +1027,17 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        let hcursor = load_cursor(style);
+        let hcursor = match style {
+            // 등록된 커스텀 이미지 커서는 맵에서 조회(없으면 None → 시스템 기본).
+            CursorStyle::Custom(id) => self
+                .inner
+                .state
+                .custom_cursors
+                .borrow_mut()
+                .get_mut(&id)
+                .and_then(|cursor| cursor.at_dpi(dpi_at_pointer())),
+            _ => load_cursor(style),
+        };
         if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
             self.post_message(
                 WM_GPUI_CURSOR_STYLE_CHANGED,
@@ -1014,6 +1046,21 @@ impl Platform for WindowsPlatform {
             );
             self.inner.state.current_cursor.set(hcursor);
         }
+    }
+
+    fn register_custom_cursor(&self, image: &CustomCursorImage) -> CursorStyle {
+        let mut cursor = CustomCursor {
+            image: image.clone(),
+            by_dpi: HashMap::new(),
+        };
+        // 지금 배율로 한 번 만들어 본다 — 잘못된 이미지는 등록하지 않고 화살표로 돌려준다.
+        if cursor.at_dpi(dpi_at_pointer()).is_none() {
+            return CursorStyle::Arrow;
+        }
+        let id = self.inner.state.custom_cursor_next_id.get();
+        self.inner.state.custom_cursor_next_id.set(id + 1);
+        self.inner.state.custom_cursors.borrow_mut().insert(id, cursor);
+        CursorStyle::Custom(id)
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
@@ -1600,8 +1647,25 @@ fn open_target_in_explorer(target: &Path) -> Result<()> {
     })
 }
 
+/// Resolves `directory` into a shell item usable as a file dialog's starting folder.
+/// Returns `None` (dialog opens wherever the shell defaults to) if it can't be resolved.
+fn dialog_start_folder(directory: &Path) -> Option<IShellItem> {
+    if directory.as_os_str().is_empty() {
+        return None;
+    }
+    let full_path = directory
+        .canonicalize()
+        .context("failed to canonicalize directory")
+        .log_err()?;
+    let full_path = dunce::simplified(&full_path).display().to_string();
+    unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path), None) }
+        .context("failed to create shell item for dialog folder")
+        .log_err()
+}
+
 fn file_open_dialog(
     options: PathPromptOptions,
+    directory: Option<PathBuf>,
     window: Option<HWND>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let folder_dialog: IFileOpenDialog =
@@ -1617,6 +1681,13 @@ fn file_open_dialog(
 
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
+
+        if let Some(start) = directory.as_deref().and_then(dialog_start_folder) {
+            folder_dialog
+                .SetFolder(&start)
+                .context("failed to set dialog folder")
+                .log_err();
+        }
 
         if let Some(prompt) = options.prompt {
             let prompt: &str = &prompt;
@@ -1653,19 +1724,10 @@ fn file_save_dialog(
     window: Option<HWND>,
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
-    if !directory.to_string_lossy().is_empty()
-        && let Some(full_path) = directory
-            .canonicalize()
-            .context("failed to canonicalize directory")
-            .log_err()
-    {
-        let full_path = dunce::simplified(&full_path);
-        let full_path_string = full_path.display().to_string();
-        let path_item: IShellItem =
-            unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
+    if let Some(start) = dialog_start_folder(&directory) {
         unsafe {
             dialog
-                .SetFolder(&path_item)
+                .SetFolder(&start)
                 .context("failed to set dialog folder")
                 .log_err()
         };

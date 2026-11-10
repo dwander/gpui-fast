@@ -98,6 +98,25 @@ struct GammaParams {
 
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+// Zoom at which a pixelated sprite switches to nearest sampling, measured in texels per device
+// pixel (1.0 = 100%, 0.5 = 200%). Exactly 100% is 1:1, so nearest is the original itself. Between
+// that and 200% one texel covers one and two device pixels by turns and lines look jagged, so those
+// zooms stay interpolated; nearest takes over from 200%.
+const PIXELATED_MAGNIFIED_TEXELS_PER_PIXEL: f32 = 0.5;
+// 0.5% slack so float/bounds-snapping error near 100% and 200% lands on the intended side.
+const PIXELATED_SLACK: f32 = 1.005;
+// PolychromeSprite::pixelated bits (same values as scene.rs).
+const PIXELATED_FLAG: u32 = 1u;
+const PIXEL_GRID_FLAG: u32 = 2u;
+const PIXEL_GRID_DARK_FLAG: u32 = 4u;
+// Zoom (device pixels per texel) where the pixel grid starts to fade in / is fully shown
+// (700% / 900%). Computed from the zoom itself, so the fade needs no animation or extra frames.
+const PIXEL_GRID_FADE_START: f32 = 7.0;
+const PIXEL_GRID_FADE_END: f32 = 9.0;
+// How far a grid line pulls a pixel toward the line colour (white or black). The colour is one choice
+// per image — choosing it per pixel flips it across mid-tone gradients and looks scaly (the app picks
+// it from the image's brightness).
+const PIXEL_GRID_STRENGTH: f32 = 0.25;
 
 struct Bounds {
     origin: vec2<f32>,
@@ -312,6 +331,11 @@ fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     let alpha = above.a + below.a * (1.0 - above.a);
+    // Both layers fully transparent would be 0/0 = NaN — harmless on an 8-bit target, but a float
+    // target keeps it and a blur smears it into a box (see the Metal shader).
+    if (alpha <= 0.0) {
+        return vec4<f32>(0.0);
+    }
     let color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
     return vec4<f32>(color, alpha);
 }
@@ -519,6 +543,8 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 struct Quad {
     order: u32,
     border_style: u32,
+    border_dashed_length: f32,
+    border_dashed_gap: f32,
     bounds: Bounds,
     content_mask: Bounds,
     background: Background,
@@ -702,9 +728,11 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             // used by browsers, but also avoids dashes from different segments
             // overlapping when dash size is smaller than the border width.
             //
-            // Dash pattern: (2 * border width) dash, (1 * border width) gap
-            let dash_length_per_width = 2.0;
-            let dash_gap_per_width = 1.0;
+            // Dash pattern: (border_dashed_length * border width) dash,
+            // (border_dashed_gap * border width) gap. Both default to the
+            // browser-like 2 and 1.
+            let dash_length_per_width = quad.border_dashed_length;
+            let dash_gap_per_width = quad.border_dashed_gap;
             let dash_period_per_width = dash_length_per_width + dash_gap_per_width;
 
             // Since the dash size is determined by border width, the density of
@@ -1259,15 +1287,37 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 // --- polychrome sprites --- //
 
+// Lays the grid on the first device-pixel row/column of each texel (its left/top edge). `texel_step`
+// is the texel advance per device pixel (fwidth). Nearest sampling paints the texel under each pixel
+// centre, so block edges already sit on device-pixel edges; marking that first row keeps the line a
+// crisp 1px even at fractional zooms.
+fn apply_pixel_grid(rgb: vec3<f32>, texel_pos: vec2<f32>, texel_step: vec2<f32>, texels_per_pixel: f32, dark: bool) -> vec3<f32> {
+    let fade = saturate((1.0 / max(texels_per_pixel, 1e-6) - PIXEL_GRID_FADE_START)
+        / (PIXEL_GRID_FADE_END - PIXEL_GRID_FADE_START));
+    let f = fract(texel_pos);
+    let px_step = max(texel_step, vec2<f32>(1e-6));
+    let from_start = f / px_step;
+    let line_cover = select(0.0, fade, any(from_start < vec2<f32>(1.0)));
+    let target_rgb = select(vec3<f32>(1.0), vec3<f32>(0.0), dark);
+    return mix(rgb, target_rgb, line_cover * PIXEL_GRID_STRENGTH);
+}
+
+// Whether a pixelated sprite takes the nearest texel at this zoom — exactly 100%, or 200% and up.
+fn pixelated_nearest(texels_per_pixel: f32) -> bool {
+    let at_native = texels_per_pixel <= PIXELATED_SLACK && texels_per_pixel * PIXELATED_SLACK >= 1.0;
+    return at_native || texels_per_pixel <= PIXELATED_MAGNIFIED_TEXELS_PER_PIXEL * PIXELATED_SLACK;
+}
+
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    pixelated: u32,
     tile: AtlasTile,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    transformation: TransformationMatrix,
 }
 
 
@@ -1275,6 +1325,9 @@ struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
+    // Position *before* the transformation, so the rounded-corner SDF stays in the sprite's
+    // own (unrotated) space. Equals `position.xy` for a unit transform.
+    @location(2) local_position: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1284,28 +1337,47 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = load_poly_sprite(instance_id);
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.local_position = unit_vertex * sprite.bounds.size + sprite.bounds.origin;
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    var sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let texel_pos = input.tile_position * atlas_size;
+    let texels_per_pixel = max(length(dpdx(texel_pos)), length(dpdy(texel_pos)));
+    let texel_step = fwidth(texel_pos);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    // Pixelated: at 100% and from 200% up, take the nearest texel as-is instead of interpolating
+    // (`pixelated_nearest`). Minified sprites and the zooms in between keep the filtered sample above.
+    let nearest_on = (sprite.pixelated & PIXELATED_FLAG) != 0u
+        && pixelated_nearest(texels_per_pixel);
+    if (nearest_on) {
+        let tile_min = vec2<f32>(sprite.tile.bounds.origin) + 0.5;
+        let tile_max = vec2<f32>(sprite.tile.bounds.origin + sprite.tile.bounds.size) - 0.5;
+        let nearest = clamp(floor(texel_pos) + 0.5, tile_min, tile_max) / atlas_size;
+        sample = textureSampleLevel(t_sprite, s_sprite, nearest, 0.0);
+    }
+    let distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if (sprite.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+    }
+    if (nearest_on && (sprite.pixelated & PIXEL_GRID_FLAG) != 0u) {
+        let dark = (sprite.pixelated & PIXEL_GRID_DARK_FLAG) != 0u;
+        color = vec4<f32>(apply_pixel_grid(color.rgb, texel_pos, texel_step, texels_per_pixel, dark), color.a);
     }
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }

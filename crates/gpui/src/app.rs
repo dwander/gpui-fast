@@ -1420,6 +1420,13 @@ impl App {
         self.platform.is_cursor_visible()
     }
 
+    /// Registers a custom image cursor and returns a [`CursorStyle`] that can be passed to
+    /// `.cursor(..)`. Platforms without support return [`CursorStyle::Arrow`].
+    /// (Currently implemented on Windows.)
+    pub fn register_custom_cursor(&self, image: &crate::CustomCursorImage) -> CursorStyle {
+        self.platform.register_custom_cursor(image)
+    }
+
     /// Returns whether non-essential animations (e.g. loading spinners) should
     /// be rendered in a static state instead of animating.
     pub fn reduce_motion(&self) -> bool {
@@ -2039,6 +2046,18 @@ impl App {
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         self.platform.prompt_for_paths(options)
+    }
+
+    /// Same as [`App::prompt_for_paths`], but the dialog starts in `directory`.
+    ///
+    /// Platforms that can't set a starting location (and paths that no longer exist) fall
+    /// back to the system default location, so this never fails on the directory alone.
+    pub fn prompt_for_paths_in(
+        &self,
+        options: PathPromptOptions,
+        directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.platform.prompt_for_paths_in(options, directory)
     }
 
     /// Displays a platform modal for selecting a new path where a file can be saved.

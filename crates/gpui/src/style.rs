@@ -8,7 +8,8 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    DEFAULT_DASH_GAP_PER_BORDER_WIDTH, DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH, PointRefinement,
+    Rgba, ScaledPixels, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
     point, px, quad, rems, size,
 };
 use collections::HashSet;
@@ -284,12 +285,35 @@ pub struct Style {
     /// The border style of this element
     pub border_style: BorderStyle,
 
+    /// The length of each border dash, as a multiple of the border width.
+    /// Only used when `border_style` is [`BorderStyle::Dashed`].
+    pub border_dashed_length: f32,
+
+    /// The gap between border dashes, as a multiple of the border width.
+    /// Only used when `border_style` is [`BorderStyle::Dashed`].
+    pub border_dashed_gap: f32,
+
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
+
+    /// Filters applied to this element's own content and children (CSS `filter`).
+    pub filter: Vec<Filter>,
+
+    /// Filters applied to the content rendered behind this element (CSS `backdrop-filter`).
+    pub backdrop_filter: Vec<Filter>,
+
+    /// A scale applied to this element and its children, for entrance/exit animations
+    /// (CSS `transform: scale()`). See [`crate::Styled::appear_scale`] for the semantics
+    /// and the caveats.
+    pub appear_scale: Option<f32>,
+
+    /// The point [`Self::appear_scale`] scales about, as a fraction of the element's size —
+    /// CSS `transform-origin`. Defaults to the center, `(0.5, 0.5)`.
+    pub appear_scale_origin: Option<Point<f32>>,
 
     /// The text style of this element
     #[refineable]
@@ -390,6 +414,50 @@ impl BoxShadow {
         self.inset = true;
         self
     }
+}
+
+/// A graphical filter that can be applied either to an element's own content
+/// (via [`Styled::filter`], like CSS `filter`) or to the content rendered behind
+/// it (via [`Styled::backdrop_filter`], like CSS `backdrop-filter`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum Filter {
+    /// A gaussian blur with the given radius, in logical pixels. Maps to CSS `blur(<px>)`.
+    Blur(Pixels),
+}
+
+impl Filter {
+    /// Whether this filter has no visible effect, so painting can skip it entirely (and the
+    /// element can avoid the offscreen isolation pass when *all* of its filters are identities).
+    ///
+    /// Each variant declares its own no-op case here rather than the pipeline special-casing
+    /// blur — adding a filter that this returns `true` for is silently dropped before it ever
+    /// reaches the renderer.
+    pub fn is_identity(&self) -> bool {
+        match self {
+            Filter::Blur(radius) => *radius <= Pixels::ZERO,
+        }
+    }
+
+    /// Lower this logical-pixel filter into its scene-space ([`ScaledFilter`]) form for the
+    /// renderer, scaling any pixel magnitudes by `factor` (the window scale factor).
+    pub fn scale(&self, factor: f32) -> ScaledFilter {
+        match self {
+            Filter::Blur(radius) => ScaledFilter::Blur(radius.scale(factor)),
+        }
+    }
+}
+
+/// The scene-space (device-pixel) form of a [`Filter`], carried on the scene primitives that the
+/// renderers consume. Produced by [`Filter::scale`]; pixel magnitudes are in [`ScaledPixels`].
+///
+/// This is intentionally a separate enum from [`Filter`] (rather than reusing it) so the scene
+/// stays in device space like every other primitive, and so the renderers `match` on it
+/// exhaustively — adding a filter variant breaks each backend's match, forcing a deliberate
+/// implement-or-decline decision per backend instead of silently rendering nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScaledFilter {
+    /// A gaussian blur with the given radius, in scaled (device) pixels.
+    Blur(ScaledPixels),
 }
 
 /// How to handle whitespace in text
@@ -708,51 +776,135 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        // `appear_scale` scales the element about `appear_scale_origin`. The box itself
+        // (background, children, border) is scaled by the renderer as a rasterized group — see
+        // `with_filter_layer` — but the drop shadow and the backdrop filter are painted *outside*
+        // that group, so their geometry is scaled here instead. Doing it geometrically is both
+        // exact and necessary: otherwise the shadow and the frosted halo would stay at full size
+        // and visibly detach from a shrunken box.
+        let scale = self.appear_scale.unwrap_or(1.);
+        let origin_fraction = self.appear_scale_origin.unwrap_or_else(|| point(0.5, 0.5));
+        let scale_anchor = bounds.origin
+            + point(
+                bounds.size.width * origin_fraction.x,
+                bounds.size.height * origin_fraction.y,
+            );
+        // Left bit-identical at 1.0: re-deriving the origin from the anchor would round it.
+        let scaled = |bounds: Bounds<Pixels>| {
+            if scale == 1. {
+                bounds
+            } else {
+                Bounds {
+                    origin: scale_anchor + (bounds.origin - scale_anchor).map(|d| d * scale),
+                    size: bounds.size.map(|length| length * scale),
+                }
+            }
+        };
 
-        let background_color = self.background.as_ref().and_then(Fill::color);
-        if background_color.is_some_and(|color| !color.is_transparent()) {
-            let mut border_color = match background_color {
-                Some(color) => match color.tag {
-                    BackgroundTag::Solid
-                    | BackgroundTag::PatternSlash
-                    | BackgroundTag::Checkerboard => color.solid,
-
-                    BackgroundTag::LinearGradient => color
-                        .colors
-                        .first()
-                        .map(|stop| stop.color)
-                        .unwrap_or_default(),
-                },
-                None => Hsla::default(),
-            };
-            border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+        // Blur the content behind this element before its (typically translucent) background
+        // is painted on top, so the background tints the frosted backdrop (CSS `backdrop-filter`).
+        //
+        // Painted *before* the drop shadow deliberately: the backdrop filter blurs whatever has
+        // been rendered into the target so far, so a shadow painted first would be part of what
+        // this element frosts. The shadow's gaussian tail reaches ~3·radius past the box and
+        // would drag a dark, near-uniform veil into the blur, flattening the contrast that makes
+        // a blur read as a blur — the effect degrades into an inner glow. (The box itself is
+        // knocked out of the drop shadow, so painting the shadow afterwards leaves the panel
+        // untouched; see `Window::paint_drop_shadows`.)
+        if !self.backdrop_filter.is_empty() {
+            window.paint_backdrop_filter(
+                scaled(bounds),
+                corner_radii.map(|radius| *radius * scale),
+                &self.backdrop_filter,
+            );
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        if scale == 1. {
+            window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        } else {
+            let shadows = self
+                .box_shadow
+                .iter()
+                .map(|shadow| BoxShadow {
+                    color: shadow.color,
+                    offset: shadow.offset.map(|length| length * scale),
+                    blur_radius: shadow.blur_radius * scale,
+                    spread_radius: shadow.spread_radius * scale,
+                    inset: shadow.inset,
+                })
+                .collect::<Vec<_>>();
+            window.paint_drop_shadows(
+                scaled(bounds),
+                corner_radii.map(|radius| *radius * scale),
+                &shadows,
+            );
+        }
 
-        crate::fast::rounded_clip::paint_children(self, bounds, window, cx, continuation);
+        // The element's own box — background, inset shadows, children, and border — painted as a
+        // unit. A `filter` (CSS `filter`) wraps this whole unit so the renderer blurs the element
+        // and its children together as one group; without a filter it paints directly.
+        let paint_box = |window: &mut Window, cx: &mut App| {
+            let background_color = self.background.as_ref().and_then(Fill::color);
+            if background_color.is_some_and(|color| !color.is_transparent()) {
+                let mut border_color = match background_color {
+                    Some(color) => match color.tag {
+                        BackgroundTag::Solid
+                        | BackgroundTag::PatternSlash
+                        | BackgroundTag::Checkerboard => color.solid,
 
-        if self.is_border_visible() {
-            let border_widths = self.border_widths.to_pixels(rem_size);
-            let mut background = self.border_color.unwrap_or_default();
-            background.a = 0.;
-            window.paint_quad(quad(
+                        BackgroundTag::LinearGradient => color
+                            .colors
+                            .first()
+                            .map(|stop| stop.color)
+                            .unwrap_or_default(),
+                    },
+                    None => Hsla::default(),
+                };
+                border_color.a = 0.;
+                window.paint_quad(quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                ));
+            }
+
+            window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+
+            crate::fast::rounded_clip::paint_children(self, bounds, window, cx, continuation);
+
+            if self.is_border_visible() {
+                let border_widths = self.border_widths.to_pixels(rem_size);
+                let mut background = self.border_color.unwrap_or_default();
+                background.a = 0.;
+                window.paint_quad_dashed(
+                    quad(
+                        bounds,
+                        corner_radii,
+                        background,
+                        border_widths,
+                        self.border_color.unwrap_or_default(),
+                        self.border_style,
+                    ),
+                    self.border_dashed_length,
+                    self.border_dashed_gap,
+                );
+            }
+        };
+
+        if self.filter.is_empty() && scale == 1. {
+            paint_box(window, cx);
+        } else {
+            window.with_filter_layer(
                 bounds,
                 corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+                &self.filter,
+                scale,
+                scale_anchor,
+                |window| paint_box(window, cx),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -804,8 +956,14 @@ impl Default for Style {
             background: None,
             border_color: None,
             border_style: BorderStyle::default(),
+            border_dashed_length: DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH,
+            border_dashed_gap: DEFAULT_DASH_GAP_PER_BORDER_WIDTH,
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            filter: Default::default(),
+            backdrop_filter: Default::default(),
+            appear_scale: None,
+            appear_scale_origin: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

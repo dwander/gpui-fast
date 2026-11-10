@@ -43,6 +43,7 @@ windows = { workspace = true, features = [
     "UI_Notifications",
     "UI_ViewManagement",
     "Wdk_System_SystemServices",
+    "Win32_Devices_Display",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_DirectComposition",

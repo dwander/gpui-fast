@@ -153,6 +153,8 @@ impl WindowsWindowInner {
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
+            WM_IME_REQUEST => self.handle_ime_request(handle, wparam, lparam),
+            WM_KILLFOCUS => self.handle_kill_focus(),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
@@ -320,6 +322,11 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.destroyed.set(true);
+        // Revoke while the handle is still valid. The drop target holds an `Rc`
+        // to this window, so a revoke deferred past destruction fails and leaks
+        // the whole window state, renderer included.
+        unsafe { windows::Win32::System::Ole::RevokeDragDrop(handle).log_err() };
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -639,17 +646,22 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn retrieve_caret_position(&self) -> Option<POINT> {
+    fn retrieve_caret_bounds(&self) -> Option<CaretRect> {
         self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
             let caret_range = input_handler.selected_text_range(false)?;
-            let caret_position = input_handler.bounds_for_range(caret_range.range)?;
-            Some(POINT {
-                // logical to physical
-                x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
-                y: (caret_position.origin.y.as_f32() * scale_factor) as i32
-                    + ((caret_position.size.height.as_f32() * scale_factor) as i32 / 2),
+            let caret = input_handler.bounds_for_range(caret_range.range)?;
+            // logical to physical
+            Some(CaretRect {
+                left: (caret.origin.x.as_f32() * scale_factor) as i32,
+                top: (caret.origin.y.as_f32() * scale_factor) as i32,
+                width: ((caret.size.width.as_f32() * scale_factor) as i32).max(1),
+                height: ((caret.size.height.as_f32() * scale_factor) as i32).max(1),
             })
         })
+    }
+
+    fn retrieve_caret_position(&self) -> Option<POINT> {
+        self.retrieve_caret_bounds().map(|caret| caret.ime_point())
     }
 
     fn handle_ime_position(&self, handle: HWND) -> Option<isize> {
@@ -657,6 +669,117 @@ impl WindowsWindowInner {
             self.update_ime_position(handle, caret_position);
         }
         Some(0)
+    }
+
+    /// Tells the OS where the caret of the focused text input is.
+    ///
+    /// The shell's text input UI (Win+V clipboard history, Win+. emoji panel) and
+    /// the IME candidate window place themselves next to the reported caret, and
+    /// fall back to the bottom right corner of the screen when nothing is known.
+    /// Reporting it only when an IME composition starts leaves those panels at the
+    /// position of the last composition, so this runs after every draw and updates
+    /// whenever the caret has moved.
+    fn sync_caret_location(&self, handle: HWND) {
+        let caret = (self.state.ime_enabled.get() && unsafe { GetFocus() } == handle)
+            .then(|| self.retrieve_caret_bounds())
+            .flatten();
+        if caret == self.state.last_caret.get() {
+            return;
+        }
+        self.state.last_caret.set(caret);
+
+        match caret {
+            Some(caret) => {
+                self.update_ime_position(handle, caret.ime_point());
+                self.show_system_caret(handle, caret);
+            }
+            None => self.hide_system_caret(),
+        }
+    }
+
+    /// Places an invisible system caret at `caret`.
+    ///
+    /// `GetGUIThreadInfo`/`OBJID_CARET` is how accessibility tools and parts of the
+    /// shell ask where the caret is, and it only knows about carets created through
+    /// `CreateCaret`. GPUI draws its own caret, so a normal one would show up twice;
+    /// giving the caret a zeroed monochrome bitmap as its shape makes it paint
+    /// nothing while still being reported (the same trick conhost uses).
+    fn show_system_caret(&self, handle: HWND, caret: CaretRect) {
+        let size = CaretRect {
+            left: 0,
+            top: 0,
+            ..caret
+        };
+        if self.state.system_caret.get().map(|(size, _)| size) != Some(size) {
+            self.hide_system_caret();
+            // Monochrome scanlines are padded to a 16-bit boundary.
+            let stride = ((caret.width as usize + 15) / 16) * 2;
+            let blank = vec![0u8; stride * caret.height as usize];
+            let bitmap = unsafe {
+                CreateBitmap(
+                    caret.width,
+                    caret.height,
+                    1,
+                    1,
+                    Some(blank.as_ptr() as *const _),
+                )
+            };
+            if bitmap.is_invalid() {
+                return;
+            }
+            unsafe {
+                if CreateCaret(handle, Some(bitmap), 0, 0).log_err().is_none() {
+                    DeleteObject(bitmap.into()).ok().log_err();
+                    return;
+                }
+                ShowCaret(Some(handle)).log_err();
+            }
+            self.state.system_caret.set(Some((size, bitmap)));
+        }
+        unsafe { SetCaretPos(caret.left, caret.top).log_err() };
+    }
+
+    /// `DefWindowProcW` destroys the caret of a window losing focus, so the
+    /// bookkeeping (and the bitmap) has to be dropped along with it.
+    fn handle_kill_focus(&self) -> Option<isize> {
+        self.hide_system_caret();
+        self.state.last_caret.set(None);
+        // Fall through to `DefWindowProcW` for the rest of the focus handling.
+        None
+    }
+
+    fn hide_system_caret(&self) {
+        let Some((_, bitmap)) = self.state.system_caret.take() else {
+            return;
+        };
+        unsafe {
+            DestroyCaret().log_err();
+            DeleteObject(bitmap.into()).ok().log_err();
+        }
+    }
+
+    /// Answers the IME's query for the caret rectangle. CUAS (the IMM32 to TSF
+    /// bridge) relays this to text services that ask for the text extent, which is
+    /// how the shell locates the caret in windows that have no TSF text store.
+    fn handle_ime_request(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        if wparam.0 as u32 != IMR_QUERYCHARPOSITION {
+            // Every other request falls through to `DefWindowProcW`.
+            return None;
+        }
+        let position = unsafe { (lparam.0 as *mut IMECHARPOSITION).as_mut() }?;
+        // `dwCharPos` indexes into the composition string; the callers that matter
+        // here ask about the insertion point, which is where the caret already is.
+        let caret = self.retrieve_caret_bounds()?;
+        let mut document = RECT::default();
+        unsafe { GetClientRect(handle, &mut document).log_err() };
+
+        position.pt = POINT {
+            x: caret.left,
+            y: caret.top,
+        };
+        position.cLineHeight = caret.height as u32;
+        position.rcDocument = document;
+        Some(1)
     }
 
     pub(crate) fn update_ime_position(&self, handle: HWND, caret_position: POINT) {
@@ -1166,16 +1289,19 @@ impl WindowsWindowInner {
     }
 
     fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
-
-        self.state.current_cursor.set(if lparam.0 == 0 {
+        let new_cursor = if lparam.0 == 0 {
             None
         } else {
             Some(HCURSOR(lparam.0 as _))
-        });
+        };
 
-        if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+        // 커서 핸들이 실제로 바뀌면 즉시 SetCursor. None↔Some 전환뿐 아니라 커서↔커서(예: 드래그 중
+        // 화살표→폴더) 변경도 반영해야 한다. 드래그 중에는 마우스 캡처로 WM_SETCURSOR 가 늦게 와서
+        // 이 즉시 적용이 없으면 포커스가 바뀔 때까지 커서가 갱신되지 않는다.
+        let changed = self.state.current_cursor.get().map(|c| c.0) != new_cursor.map(|c| c.0);
+        self.state.current_cursor.set(new_cursor);
+        if changed {
+            unsafe { SetCursor(new_cursor) };
         }
 
         Some(0)
@@ -1391,6 +1517,9 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
+        // [PiCell] 셸 텍스트 입력 UI(Win+V·Win+.·IME 후보창)에 캐럿 위치를 매 프레임 보고한다.
+        // ValidateRect 는 gpui-fast 가 그리기 시작에서 한다(fast::frame_schedule::validate_current_paint).
+        self.sync_caret_location(handle);
         #[cfg(test)]
         crate::fast::native_tests::paint_done(handle);
 
@@ -1480,6 +1609,26 @@ impl WindowsWindowInner {
         let result = f(&mut input_handler, scale_factor);
         self.state.input_handler.set(Some(input_handler));
         result
+    }
+}
+
+/// The caret of the focused text input, in physical client coordinates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaretRect {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl CaretRect {
+    /// The point IMEs place their composition and candidate windows at: the
+    /// middle of the caret, so that the window clears the line either way.
+    fn ime_point(&self) -> POINT {
+        POINT {
+            x: self.left,
+            y: self.top + self.height / 2,
+        }
     }
 }
 

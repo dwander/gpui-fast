@@ -84,6 +84,11 @@ pub(crate) fn draw_primitives_to_texture(
     if scene.paths.is_empty() {
         return Ok(None);
     }
+    // [PiCell] Blur filters run their own passes (offscreen scene, ping/pong targets) in
+    // upstream's loop, `MetalRenderer::draw_primitives_to_texture`: leave such a frame to it.
+    if !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty() {
+        return Ok(None);
+    }
     let path_batches = plan_paths(scene);
     let vertices = write_vertices(scene, &path_batches, writer)?;
 
@@ -199,6 +204,10 @@ pub(crate) fn draw_primitives_to_texture(
                 }
             }
             PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+            // [PiCell] A frame holding a filter is drawn by upstream's loop (see above).
+            PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => {
+                unreachable!("filters are drawn by upstream's loop")
+            }
         }
     }
 

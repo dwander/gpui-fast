@@ -451,6 +451,15 @@ pub trait Platform: 'static {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
+    /// Same as [`Platform::prompt_for_paths`], but the dialog starts in `directory`.
+    /// Platforms that can't set a starting location fall back to the system default one.
+    fn prompt_for_paths_in(
+        &self,
+        options: PathPromptOptions,
+        _directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.prompt_for_paths(options)
+    }
     fn prompt_for_new_path(
         &self,
         directory: &Path,
@@ -574,6 +583,12 @@ pub trait Platform: 'static {
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf>;
 
     fn set_cursor_style(&self, style: CursorStyle);
+
+    /// Registers a custom image cursor and returns a [`CursorStyle`] referencing it.
+    /// Platforms without support return [`CursorStyle::Arrow`] (the default impl).
+    fn register_custom_cursor(&self, _image: &CustomCursorImage) -> CursorStyle {
+        CursorStyle::Arrow
+    }
 
     /// Hides the mouse cursor until the user moves the mouse over one of
     /// this application's windows.
@@ -1269,6 +1284,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    /// Move and resize the window in one step, in the same logical, display-relative
+    /// coordinates that [`PlatformWindow::bounds`] reports.
+    ///
+    /// `resize` keeps the existing origin, so a caller that wants to keep a window
+    /// centered while its size follows its content has no way to express that without
+    /// a visible two-step jump. Backends that cannot move a window fall back to
+    /// resizing in place.
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.resize(bounds.size);
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
@@ -1300,6 +1325,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Present values above 1.0 as HDR (macOS EDR, Windows scRGB); `headroom` is the display's
+    /// current headroom that HDR sprites are compressed into. Called after every drawn frame with
+    /// whether that frame asked for HDR (`Window::set_hdr_content`), so implementations should be
+    /// cheap when nothing changed. Platforms without HDR output ignore it.
+    fn set_hdr_content(&self, _enabled: bool, _headroom: f32) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -1366,6 +1396,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
+    /// Dim (or restore) the traffic-light buttons.
+    ///
+    /// The traffic lights are OS-drawn and sit above the window's own content, so an in-app modal
+    /// backdrop can't cover them - they stay full-brightness while everything behind them is
+    /// dimmed. Call this while such a modal is up to fade them to match. No-op where there are no
+    /// traffic lights.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_lights_dimmed(&self, _dimmed: bool) {}
+    /// Hides (or restores) the macOS traffic-light buttons, for a window that shows nothing but
+    /// its content. Unlike dimming, hidden buttons can't be clicked. No-op where there are no
+    /// traffic lights.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_lights_hidden(&self, _hidden: bool) {}
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
@@ -1415,6 +1458,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         WindowControls::default()
     }
     fn set_client_inset(&self, _inset: Pixels) {}
+
+    /// Reports whether the element under the cursor accepts the drag currently hovering this
+    /// window. Called once per drawn frame for as long as a drag is in flight — and *only* then,
+    /// so a platform can treat "no report since the drag arrived" as "don't know yet" rather than
+    /// as a refusal. Platforms whose OS drag protocol asks the window for a drop effect (Windows
+    /// OLE) use it to show a "not allowed" cursor over areas that registered no drop handler,
+    /// instead of promising a copy that would silently do nothing. No-op elsewhere.
+    fn set_drop_target_hovered(&self, _hovered: bool) {}
+
     fn set_client_corner_radii(&self, _radii: Corners<Pixels>) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
@@ -1787,7 +1839,13 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
-            AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
+            AtlasKey::Image(params) => {
+                if params.hdr {
+                    AtlasTextureKind::PolychromeHdr
+                } else {
+                    AtlasTextureKind::Polychrome
+                }
+            }
         }
     }
 }
@@ -2031,6 +2089,9 @@ pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
     Subpixel = 2,
+    /// RGBA 16-bit float textures for HDR images (see `RenderImage::new_hdr`). Kept apart from
+    /// `Polychrome` so an HDR tile never lands in an 8-bit atlas texture.
+    PolychromeHdr = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3026,6 +3087,22 @@ impl From<&str> for PromptButton {
     }
 }
 
+/// A custom image cursor source (RGBA8, row-major, top-down) + hotspot, for
+/// [`Platform::register_custom_cursor`] / [`App::register_custom_cursor`](crate::App::register_custom_cursor).
+#[derive(Clone, Debug)]
+pub struct CustomCursorImage {
+    /// Pixel data, `width * height * 4` bytes, RGBA8 (top-down).
+    pub rgba: Vec<u8>,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Hotspot x (click point) in image pixels.
+    pub hot_x: u32,
+    /// Hotspot y (click point) in image pixels.
+    pub hot_y: u32,
+}
+
 /// The style of the cursor (pointer)
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
@@ -3112,6 +3189,12 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// A custom image cursor previously registered via
+    /// [`App::register_custom_cursor`](crate::App::register_custom_cursor),
+    /// identified by an interned id. Platforms without custom-cursor support fall back to
+    /// [`CursorStyle::Arrow`]. (Currently implemented on Windows.)
+    Custom(u32),
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -3720,6 +3803,7 @@ mod atlas_tests {
         AtlasKey::Image(RenderImageParams {
             image_id: crate::ImageId(image_id),
             frame_index: 0,
+            hdr: false,
         })
     }
 

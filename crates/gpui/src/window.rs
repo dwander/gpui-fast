@@ -8,23 +8,26 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
-    prelude::*, px, rems, size, transparent_black,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle,
+    DEFAULT_DASH_GAP_PER_BORDER_WIDTH, DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH, Decorations,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    Entity, EntityId, EventEmitter, ExternalDragPayload, FileDragPaths, FileDropEvent, Filter,
+    FilterBoundary, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler,
+    InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, PixelGrid, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    ScaledFilter, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
+    WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1268,6 +1271,14 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+    /// Whether the frame being drawn found an element under the cursor that accepts the active
+    /// drag. Recomputed from scratch every draw; pushed to the platform window (which may use it
+    /// to show a "not allowed" drag cursor) on every frame drawn while a drag is in flight.
+    pub(crate) drop_target_hovered: bool,
+    /// The headroom of the HDR content requested while drawing this frame (`None` = none), via
+    /// [`Window::set_hdr_content`]. Cleared every draw and pushed to the platform window after it,
+    /// so HDR presentation ends with the last frame that asked for it.
+    hdr_content: Cell<Option<f32>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
     /// input session can restart the IME connection).
@@ -2401,6 +2412,8 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
+            drop_target_hovered: false,
+            hdr_content: Cell::new(None),
             last_text_input_configuration: None,
             focused_text_input: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3150,6 +3163,13 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Move and resize the window in one step, in the same coordinates [`Window::bounds`]
+    /// reports. Unlike [`Window::resize`] this can keep a window centered while its size
+    /// follows its content. Backends that cannot move a window only resize it.
+    pub fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.platform_window.set_bounds(bounds);
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()
@@ -3312,6 +3332,20 @@ impl Window {
         self.platform_window.set_traffic_light_position(position);
     }
 
+    /// Dims (or restores) the macOS traffic-light buttons so they don't stay bright above an
+    /// in-app modal backdrop. See [`PlatformWindow::set_traffic_lights_dimmed`].
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_lights_dimmed(&self, dimmed: bool) {
+        self.platform_window.set_traffic_lights_dimmed(dimmed);
+    }
+
+    /// Hides (or restores) the macOS traffic-light buttons. See
+    /// [`PlatformWindow::set_traffic_lights_hidden`].
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_lights_hidden(&self, hidden: bool) {
+        self.platform_window.set_traffic_lights_hidden(hidden);
+    }
+
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
@@ -3321,6 +3355,37 @@ impl Window {
     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.platform_window
             .set_background_appearance(background_appearance);
+    }
+
+    /// Asks the platform to present pixel values above 1.0 as high-dynamic-range content (macOS
+    /// EDR, Windows scRGB) **for the frame being drawn**. Call it with `true` while painting an
+    /// HDR image (`RenderImage::new_hdr`), every frame you do; a frame without such a call — the
+    /// image changed, its view was hidden or dropped — ends HDR presentation, so the display only
+    /// stays in extended range while there is something to show. `false` asks for nothing
+    /// (another element may still ask). Calls outside a draw, or from a view replayed from cache,
+    /// don't count.
+    ///
+    /// Only a **visible** request counts: called during paint, the current content mask has to
+    /// meet the window. Ask from inside the bounds showing the image (`with_content_mask`) and an
+    /// element parked off-screen to keep its focus, or clipped away, asks for nothing. (During
+    /// `render` there is no mask yet, so a call there always counts.)
+    ///
+    /// `headroom` is the display's current headroom (multiples of SDR white): HDR images are
+    /// soft-clipped into it each frame, so pass the live value. A no-op on platforms without HDR
+    /// presentation.
+    pub fn set_hdr_content(&self, enabled: bool, headroom: f32) {
+        let window = Bounds {
+            origin: Point::default(),
+            size: self.viewport_size,
+        };
+        let visible = self
+            .content_mask_stack
+            .last()
+            .is_none_or(|mask| mask.bounds.intersects(&window));
+        if enabled && visible {
+            let headroom = self.hdr_content.get().map_or(headroom, |h| h.max(headroom));
+            self.hdr_content.set(Some(headroom));
+        }
     }
 
     /// Mark the window as dirty at the platform level.
@@ -3706,6 +3771,8 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        // Rebuilt by the drop-capable elements painted below (see `Window::mark_drop_target_hovered`).
+        self.drop_target_hovered = false;
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -3726,7 +3793,12 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            // Rebuilt by the views drawn below (see `Window::set_hdr_content`).
+            self.hdr_content.set(None);
             self.draw_roots(cx);
+            let hdr_headroom = self.hdr_content.get();
+            self.platform_window
+                .set_hdr_content(hdr_headroom.is_some(), hdr_headroom.unwrap_or(1.0));
             #[cfg(feature = "profiler")]
             {
                 let viewport_size = self.viewport_size;
@@ -3740,6 +3812,15 @@ impl Window {
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
+
+        // Tell the platform whether this frame had a drop target under the cursor, so an OS drag
+        // hovering us can show "not allowed" where nothing would accept it. Reported every frame a
+        // drag is in flight rather than only on change: silence is what tells the platform no frame
+        // has been drawn since the drag arrived, which is not the same as a refusal.
+        if cx.active_drag.is_some() {
+            self.platform_window
+                .set_drop_target_hovered(self.drop_target_hovered);
+        }
 
         // Register requested input handler with the platform window.
         // Use .take() instead of .pop() to preserve Vec length, so that cached
@@ -4237,6 +4318,11 @@ impl Window {
             return;
         }
 
+        // Deferred draws are overlays (tooltips, popovers, drag images) and must sort above the
+        // whole main scene. Raise the order floor so they do — this also keeps a deferred
+        // backdrop's order from falling inside a content-filter order range left by the main scene.
+        self.next_frame.scene.raise_order_floor();
+
         let traversal_order = self.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
@@ -4560,6 +4646,13 @@ impl Window {
         result
     }
 
+    /// Records that the element being painted sits under the cursor and accepts the active drag.
+    /// Latched for the rest of the frame and reported to the platform window at the end of
+    /// [`Window::draw`] — see [`PlatformWindow::set_drop_target_hovered`].
+    pub(crate) fn mark_drop_target_hovered(&mut self) {
+        self.drop_target_hovered = true;
+    }
+
     /// When you call this method during [`Element::prepaint`], containing elements will attempt to
     /// scroll to cause the specified bounds to become visible. When they decide to autoscroll, they will call
     /// [`Element::prepaint`] again with a new set of bounds. See [`crate::List`] for an example of an element
@@ -4861,6 +4954,10 @@ impl Window {
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
     ///
+    /// The element's own box is knocked out of the shadow (CSS clips a drop shadow to outside
+    /// the border box), so a translucent background is not tinted by the shadow beneath it.
+    /// `element_bounds`/`element_corner_radii` on each [`Shadow`] describe that knockout.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_drop_shadows(
         &mut self,
@@ -4979,6 +5076,107 @@ impl Window {
         }
     }
 
+    /// Paint a backdrop filter into the scene for the next frame at the current z-index. The
+    /// renderer blurs the content already painted behind `bounds` and composites the result
+    /// into the rounded rectangle described by `bounds` and `corner_radii` — the CSS
+    /// `backdrop-filter` effect (frosted glass). Typically the element then paints a translucent
+    /// background quad on top so its color tints the blurred backdrop.
+    ///
+    /// Does nothing when `filters` produce no visible blur.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        filters: &[Filter],
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let filters: SmallVec<[ScaledFilter; 4]> = filters
+            .iter()
+            .filter(|filter| !filter.is_identity())
+            .map(|filter| filter.scale(scale_factor))
+            .collect();
+        if filters.is_empty() {
+            return;
+        }
+
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            filters,
+            opacity: self.element_opacity(),
+        });
+    }
+
+    /// Isolate the painting performed by `f` into a content-filter group: the renderer renders
+    /// everything `f` paints into an offscreen target, blurs it as a single layer, and
+    /// composites the result back into the rounded rectangle described by `bounds` and
+    /// `corner_radii` — the CSS `filter` effect (e.g. blurring an element and its children).
+    ///
+    /// `scale` resamples the isolated group about `scale_anchor` as it is composited back, like a
+    /// CSS transform (see [`crate::Styled::appear_scale`]); pass `1.0` to composite 1:1. The
+    /// isolation pass is what makes this possible, so a `scale` other than `1.0` opts into it
+    /// even with no filters.
+    ///
+    /// When `filters` produce no visible blur *and* `scale` is `1.0` this simply runs `f` with no
+    /// offscreen indirection.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_filter_layer<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        filters: &[Filter],
+        scale: f32,
+        scale_anchor: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let filters: SmallVec<[ScaledFilter; 4]> = filters
+            .iter()
+            .filter(|filter| !filter.is_identity())
+            .map(|filter| filter.scale(scale_factor))
+            .collect();
+        if filters.is_empty() && scale == 1.0 {
+            return f(self);
+        }
+
+        // Snapshot the (scaled) group parameters once so the start and end markers agree.
+        //
+        // `opacity` is 1.0 — NOT `element_opacity()`. The group's children/bg/border are painted
+        // through the normal paint methods while `element_opacity` is still in effect, so they
+        // already carry the element's opacity (consistent with gpui's per-primitive opacity for
+        // non-filtered elements). Re-applying it at composite time would double it (e.g.
+        // `.blur(r).opacity(0.5)` would render at 0.25 instead of 0.5).
+        let boundary = FilterBoundary {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            filters,
+            opacity: 1.0,
+            scale,
+            scale_anchor: scale_anchor.scale(scale_factor),
+            is_start: true,
+        };
+
+        self.next_frame.scene.insert_primitive(boundary.clone());
+        let result = f(self);
+        self.next_frame.scene.insert_primitive(FilterBoundary {
+            is_start: false,
+            ..boundary
+        });
+
+        result
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -4989,11 +5187,39 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.paint_quad_dashed(
+            quad,
+            DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH,
+            DEFAULT_DASH_GAP_PER_BORDER_WIDTH,
+        )
+    }
+
+    /// Paints a quad whose dashed border uses the given dash length and gap,
+    /// each as a multiple of the border width. Both are ignored unless the
+    /// quad's border style is [`BorderStyle::Dashed`].
+    ///
+    /// This is the same as [`Window::paint_quad`], which uses the browser-like
+    /// defaults of 2 and 1. Widening the gap relative to the length gives a
+    /// sparser dash without thickening the border.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_quad_dashed(&mut self, quad: PaintQuad, dash_length: f32, dash_gap: f32) {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
+        // A zero-length period would divide by zero in the shader and erase the
+        // border entirely, so an empty dash pattern falls back to the default.
+        let (dashed_length, dashed_gap) = if dash_length.max(0.) + dash_gap.max(0.) > 0. {
+            (dash_length.max(0.), dash_gap.max(0.))
+        } else {
+            (
+                DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH,
+                DEFAULT_DASH_GAP_PER_BORDER_WIDTH,
+            )
+        };
         let quad = Quad {
             order: 0,
             bounds: snapped_bounds,
@@ -5003,6 +5229,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            border_dashed_length: dashed_length,
+            border_dashed_gap: dashed_gap,
         };
 
         if !quad.background.is_transparent() {
@@ -5264,13 +5492,14 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                pixelated: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
                 tile,
                 opacity,
+                transformation: TransformationMatrix::unit(),
             });
         }
         Ok(())
@@ -5349,6 +5578,19 @@ impl Window {
     ///
     /// The visible region rendered is `bounds.intersect(&image_bounds)`, with `corner_radii`
     /// applied to `bounds`.
+    ///
+    /// `transformation` rotates/scales the resulting quad around the origin baked into the
+    /// matrix (see [`crate::Transformation`]). Clipping against the content mask happens after
+    /// the transform, so a rotated image is still clipped by its scrolling/overflow ancestors.
+    /// Note that `bounds.intersect(&image_bounds)` is computed *before* the transform — pass
+    /// equal rects (e.g. `ObjectFit::Fill`) when rotating, or the sub-tiling below will slice
+    /// the image along unrotated axes.
+    ///
+    /// `pixelated` shows each image pixel as a hard-edged square when the image is drawn at its
+    /// pixel size or at twice it and beyond (see [`PolychromeSprite::pixelated`]); other draws
+    /// are filtered.
+    /// `pixel_grid` adds a grid along the pixel edges at high zoom (see
+    /// [`PolychromeSprite::PIXEL_GRID`]); it needs `pixelated`.
     pub fn paint_image(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -5357,6 +5599,9 @@ impl Window {
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
+        pixelated: bool,
+        pixel_grid: PixelGrid,
+        transformation: TransformationMatrix,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -5371,6 +5616,7 @@ impl Window {
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
+            hdr: data.is_half_float(),
         };
 
         let tile = self
@@ -5436,13 +5682,15 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            pixelated: PolychromeSprite::pixelated_flags(pixelated, pixel_grid)
+                | if data.is_wide_gamut() { PolychromeSprite::WIDE_GAMUT } else { 0 },
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation,
         });
         Ok(())
     }
@@ -5476,6 +5724,7 @@ impl Window {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
+                hdr: data.is_half_float(),
             };
 
             self.sprite_atlas.remove(&params.clone().into());
@@ -5493,6 +5742,7 @@ impl Window {
                     &RenderImageParams {
                         image_id: data.id,
                         frame_index,
+                        hdr: data.is_half_float(),
                     }
                     .into(),
                 )
@@ -5926,7 +6176,14 @@ impl Window {
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            // Windows can send WM_MOUSEMOVE while the pointer is stationary (e.g. after
+            // a cursor/window update). Treating that as a modality change alternates
+            // mouse/keyboard on every held key and invalidates every cached view twice.
+            // Still dispatch the event below so hover geometry and modifiers stay current.
+            PlatformInput::MouseMove(event) if event.position != self.mouse_position => {
+                InputModality::Mouse
+            }
+            PlatformInput::MouseDown(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -6099,6 +6356,29 @@ impl Window {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
         }
+    }
+
+    /// Starts a native file drag out of this window, carrying `paths`.
+    ///
+    /// This is the explicit counterpart to [`Self::promote_external_drag_to_platform`], which turns
+    /// an in-app GPUI drag into a platform drag once the pointer leaves the window. Apps that track
+    /// the drag gesture themselves (their own press-and-move threshold, their own drag rendering)
+    /// call this instead, and get the same platform drag without going through `on_drag`.
+    ///
+    /// Returns whether the platform actually started a drag session. `false` means nothing is being
+    /// dragged - either the platform has no outbound drag support or it declined (for example
+    /// macOS needs a retained left mouse-down event, so this must be called while the button is
+    /// still down).
+    ///
+    /// The drag runs asynchronously on platforms whose session is non-blocking (macOS), so this
+    /// returning does not mean the drag has finished. Note that the destination performs the file
+    /// operation there: a move is carried out by the receiving app, and the source must not delete
+    /// the originals itself.
+    pub fn start_external_drag(&self, paths: FileDragPaths) -> bool {
+        self.platform_window.can_start_external_drag()
+            && self
+                .platform_window
+                .start_external_drag(&ExternalDragPayload::Files(paths))
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
@@ -9042,6 +9322,45 @@ mod tests {
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn stationary_mouse_move_does_not_interrupt_keyboard_navigation(cx: &mut TestAppContext) {
+        let handle = cx.add_window(|_, _| EmptyView);
+        cx.update_window(handle.into(), |_, window, cx| {
+            let position = point(px(40.), px(50.));
+            let mouse_move = |position| PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Default::default(),
+            });
+            let key_down = || PlatformInput::KeyDown(KeyDownEvent {
+                keystroke: Keystroke::parse("right").unwrap(),
+                is_held: true,
+                prefer_character_input: false,
+            });
+            window.dispatch_event(mouse_move(position), cx);
+            window.dispatch_event(key_down(), cx);
+            window.draw(cx).clear(cx);
+            for _ in 0..3 {
+                window.dispatch_event(mouse_move(position), cx);
+                assert!(window.last_input_was_keyboard());
+                assert!(!window.invalidator.is_dirty(), "stationary moves must not invalidate cached views");
+                window.dispatch_event(key_down(), cx);
+                assert!(!window.invalidator.is_dirty());
+            }
+            window.dispatch_event(mouse_move(point(px(41.), px(50.))), cx);
+            assert!(!window.last_input_was_keyboard(), "real movement restores mouse modality");
+            window.dispatch_event(key_down(), cx);
+            window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(41.), px(50.)),
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }), cx);
+            assert!(!window.last_input_was_keyboard(), "clicking without movement restores mouse modality");
+        }).unwrap();
     }
 
     /// A frame request that arrives while next-frame callbacks are pending

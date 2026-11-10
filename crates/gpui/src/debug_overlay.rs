@@ -3,8 +3,9 @@
 //! infinitely triggering new frames).
 
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
-    Size, point, rgba, size, transparent_black,
+    BorderStyle, Bounds, ContentMask, Corners, DEFAULT_DASH_GAP_PER_BORDER_WIDTH,
+    DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene, Size,
+    point, rgba, size, transparent_black,
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -219,6 +220,8 @@ fn solid_quad(
     Quad {
         order: 0,
         border_style: BorderStyle::Solid,
+        border_dashed_length: DEFAULT_DASH_LENGTH_PER_BORDER_WIDTH,
+        border_dashed_gap: DEFAULT_DASH_GAP_PER_BORDER_WIDTH,
         bounds,
         content_mask: *content_mask,
         background: color.into(),

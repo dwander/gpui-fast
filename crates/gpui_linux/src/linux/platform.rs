@@ -1386,6 +1386,8 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        // 커스텀 이미지 커서는 아직 Linux 미구현 → 기본 커서 폴백.
+        CursorStyle::Custom(_) => &[DEFAULT_CURSOR_ICON_NAME],
     }
 }
 

@@ -265,6 +265,10 @@ pub(crate) fn drawn_bounds(primitive: &Primitive) -> Bounds<ScaledPixels> {
         Primitive::SubpixelSprite(sprite) => {
             transformed_bounds(sprite.bounds, &sprite.transformation)
         }
+        // [PiCell] raster images rotate too (`StyledImage::with_transformation`).
+        Primitive::PolychromeSprite(sprite) => {
+            transformed_bounds(sprite.bounds, &sprite.transformation)
+        }
         primitive => *primitive.bounds(),
     }
 }
@@ -353,10 +357,22 @@ pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixel
         Primitive::PolychromeSprite(sprite) => {
             mv(&mut sprite.bounds);
             mv(&mut sprite.content_mask.bounds);
+            // [PiCell] raster images rotate too (`StyledImage::with_transformation`).
+            translate_transformation(&mut sprite.transformation, delta);
         }
         Primitive::Surface(surface) => {
             mv(&mut surface.bounds);
             mv(&mut surface.content_mask.bounds);
+        }
+        // [PiCell] blur filters (backdrop-filter / filter)
+        Primitive::BackdropFilter(filter) => {
+            mv(&mut filter.bounds);
+            mv(&mut filter.content_mask.bounds);
+        }
+        Primitive::FilterBoundary(boundary) => {
+            mv(&mut boundary.bounds);
+            mv(&mut boundary.content_mask.bounds);
+            boundary.scale_anchor = boundary.scale_anchor + delta;
         }
     }
 }

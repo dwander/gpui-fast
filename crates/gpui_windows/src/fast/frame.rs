@@ -42,6 +42,9 @@ pub(crate) struct FrameState {
     /// The scroll layer tiles the frames composite.
     pub(crate) layers: TileCache,
     pub(crate) rounded_masks: crate::fast::rounded_clip::Masks,
+    /// [PiCell] The frame's blur filter targets while it holds a filter or HDR output is on;
+    /// `DirectXRenderer::render` sets it around `draw_batches`.
+    pub(crate) picell_filters: Option<crate::picell_filters::FilterTargets>,
 }
 
 /// The Direct3D objects a scene is drawn with.
@@ -204,6 +207,7 @@ pub(crate) fn draw_scene_masked(
             path_vertices,
             path_sprites,
             layers,
+            picell_filters,
             ..
         } = frame;
         let mut draw = Draw {
@@ -228,6 +232,19 @@ pub(crate) fn draw_scene_masked(
                     // Layer tiles never hold paths (spec §5.6).
                     debug_assert!(false, "paths drawn into a target without path textures");
                     continue;
+                };
+                // [PiCell] With filters the batches draw into the offscreen scene or a filter
+                // group, not the swap chain: paths go back to that target after their pass.
+                let filtered_targets;
+                let targets = match picell_filters.as_ref() {
+                    Some(filters) => {
+                        filtered_targets = PathTargets {
+                            render_target_view: &filters.current_rtv,
+                            ..*targets
+                        };
+                        &filtered_targets
+                    }
+                    None => targets,
                 };
                 rasterize_paths(
                     &mut draw,
@@ -297,6 +314,24 @@ pub(crate) fn draw_scene_masked(
             }
             // Upstream draws nothing for surfaces on Windows either.
             PrimitiveBatch::Surfaces(_) => Ok(()),
+            // [PiCell] Blur filters run their own passes on the device context, binding shaders,
+            // targets and textures behind `DrawState`'s back: it forgets what it bound.
+            PrimitiveBatch::BackdropFilters(range) => match picell_filters.as_mut() {
+                Some(filters) => {
+                    let drawn = filters.backdrop_filters(&scene.backdrop_filters[range]);
+                    draw.state.forget();
+                    drawn
+                }
+                None => Ok(()),
+            },
+            PrimitiveBatch::FilterBoundary(ix) => match picell_filters.as_mut() {
+                Some(filters) => {
+                    let drawn = filters.boundary(&scene.filter_boundaries[ix]);
+                    draw.state.forget();
+                    drawn
+                }
+                None => Ok(()),
+            },
         }
         .with_context(|| scene_too_large(scene))?;
     }

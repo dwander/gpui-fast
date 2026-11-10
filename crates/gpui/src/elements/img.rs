@@ -1,9 +1,10 @@
 use crate::{
-    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
-    decode_static_image, decode_webp_image, px,
+    AnyElement, AnyImageCache, App, Asset, AssetLogger, Background, BorderStyle, Bounds,
+    DefiniteLength, Edges, Element, ElementId, Entity, GlobalElementId, Hitbox, Hsla, Image,
+    ImageCache, InspectorElementId, InteractiveElement, Interactivity, IntoElement, LayoutId,
+    Length, ObjectFit, Pixels, RenderImage, Resource, SharedString, SharedUri, StyleRefinement,
+    Styled, Task, Transformation, TransformationMatrix, Window, decode_gif_image,
+    decode_static_image, decode_webp_image, px, quad,
 };
 use anyhow::Result;
 
@@ -11,6 +12,7 @@ use futures::Future;
 use gpui_util::ResultExt;
 use image::{ImageError, ImageFormat};
 use scheduler::Instant;
+use smallvec::SmallVec;
 use std::{
     fs,
     io::{self},
@@ -121,10 +123,30 @@ where
     }
 }
 
+/// The pixel grid drawn over a magnified [`StyledImage::pixelated`] image, and its line colour.
+///
+/// The colour is one choice for the whole image: picking it per pixel (dark lines on light pixels
+/// and vice versa) flips the line colour across smooth mid-tone gradients and makes them look
+/// scaly. Callers pick it from the image as a whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PixelGrid {
+    /// No grid.
+    #[default]
+    Off,
+    /// Light lines, for mostly dark images.
+    Light,
+    /// Dark lines, for mostly light images.
+    Dark,
+}
+
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
+    pixelated: bool,
+    pixel_grid: PixelGrid,
     object_fit: ObjectFit,
+    transformation: Option<Transformation>,
+    backdrop: SmallVec<[Background; 2]>,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -133,7 +155,11 @@ impl Default for ImageStyle {
     fn default() -> Self {
         Self {
             grayscale: false,
+            pixelated: false,
+            pixel_grid: PixelGrid::Off,
             object_fit: ObjectFit::Contain,
+            transformation: None,
+            backdrop: SmallVec::new(),
             loading: None,
             fallback: None,
         }
@@ -151,9 +177,52 @@ pub trait StyledImage: Sized {
         self
     }
 
+    /// Show each image pixel as a hard-edged square instead of interpolating between pixels —
+    /// like CSS `image-rendering: pixelated` — when the image is drawn at exactly its pixel size
+    /// or at twice it and beyond. Zooms in between stay filtered (one pixel would cover one and
+    /// two screen pixels by turns, so lines look jagged), as does drawing it smaller.
+    fn pixelated(mut self, pixelated: bool) -> Self {
+        self.image_style().pixelated = pixelated;
+        self
+    }
+
+    /// Draw a grid along the pixel edges once a [`Self::pixelated`] image is zoomed far enough
+    /// in for single pixels to be told apart (fades in between 700% and 900%). Drawn by the
+    /// image shader itself, so it adds no elements or primitives. No effect without `pixelated`.
+    /// The line colour is one choice for the whole image (see [`PixelGrid`]).
+    fn pixel_grid(mut self, pixel_grid: PixelGrid) -> Self {
+        self.image_style().pixel_grid = pixel_grid;
+        self
+    }
+
     /// Set the object fit for the image.
     fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.image_style().object_fit = object_fit;
+        self
+    }
+
+    /// Paint background layers behind the image, covering exactly the rect the image is
+    /// painted into (`object_fit` applied) rather than the whole element bounds.
+    ///
+    /// `.bg()` covers the element bounds, so a letterboxed image (`ObjectFit::Contain`) would
+    /// get the background in the empty bars too. This is for backgrounds that only make sense
+    /// *under the pixels*, such as a checkerboard behind an image with an alpha channel.
+    /// Layers paint in the given order (first = bottom).
+    ///
+    /// The layers are not affected by [`Self::with_transformation`] — they always cover the
+    /// untransformed painted rect.
+    fn image_backdrop(mut self, layers: impl IntoIterator<Item = Background>) -> Self {
+        self.image_style().backdrop = layers.into_iter().collect();
+        self
+    }
+
+    /// Transform the image (rotate/scale/translate) around the center of its painted rect.
+    ///
+    /// Layout and hit testing are unaffected — only the painted quad moves. Combine with
+    /// [`ObjectFit::Fill`] when rotating so the painted rect matches the element bounds
+    /// (see [`crate::Window::paint_image`]).
+    fn with_transformation(mut self, transformation: Transformation) -> Self {
+        self.image_style().transformation = Some(transformation);
         self
     }
 
@@ -488,6 +557,24 @@ impl Element for Img {
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                    for layer in self.style.backdrop.iter().copied() {
+                        window.paint_quad(quad(
+                            new_bounds,
+                            corner_radii,
+                            layer,
+                            Edges::default(),
+                            Hsla::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                    let transformation = self
+                        .style
+                        .transformation
+                        .map(|transformation| {
+                            transformation
+                                .into_matrix(new_bounds.center(), window.scale_factor())
+                        })
+                        .unwrap_or_else(TransformationMatrix::unit);
                     window
                         .paint_image(
                             bounds,
@@ -496,6 +583,9 @@ impl Element for Img {
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            self.style.pixelated,
+                            self.style.pixel_grid,
+                            transformation,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {

@@ -501,7 +501,8 @@ pub(crate) fn insert_tile_quads(
             let tile = frame.tile_bounds(coord);
             scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                pixelated: 0,
+                transformation: crate::TransformationMatrix::unit(),
                 grayscale: false.into(),
                 opacity: 1.,
                 bounds: Bounds {
@@ -696,6 +697,9 @@ fn clip_primitive(primitive: &mut Primitive, viewports: Viewports) {
         Primitive::SubpixelSprite(p) => clip(&mut p.content_mask),
         Primitive::PolychromeSprite(p) => clip(&mut p.content_mask),
         Primitive::Surface(p) => clip(&mut p.content_mask),
+        // [PiCell] blur filters (backdrop-filter / filter)
+        Primitive::BackdropFilter(p) => clip(&mut p.content_mask),
+        Primitive::FilterBoundary(p) => clip(&mut p.content_mask),
     }
 }
 
@@ -751,10 +755,16 @@ fn repaint(
         size: region.size,
     };
     let (content, overlay) = crate::fast::layers::overlay::lift(content);
-    let has_paths = content
-        .paint_operations
-        .iter()
-        .any(|operation| matches!(operation, PaintOperation::Primitive(Primitive::Path(_))));
+    // [PiCell] Content holding a blur filter is drawn into the frame like content holding a path:
+    // a filter samples what the frame has rendered under it, which a tile does not hold.
+    let has_paths = content.paint_operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::Primitive(
+                Primitive::Path(_) | Primitive::BackdropFilter(_) | Primitive::FilterBoundary(_)
+            )
+        )
+    });
     let mut visible = painting.viewport.scale(scale_factor);
     visible.origin += to_content;
     let mut rendered_work = 0;

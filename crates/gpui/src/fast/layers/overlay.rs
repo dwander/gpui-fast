@@ -57,6 +57,9 @@ fn rank(primitive: &Primitive) -> u8 {
         Primitive::SubpixelSprite(_) => 5,
         Primitive::PolychromeSprite(_) => 6,
         Primitive::Surface(_) => 7,
+        // [PiCell] blur filters; `split` never lifts content holding them.
+        Primitive::BackdropFilter(_) => 8,
+        Primitive::FilterBoundary(_) => 9,
     }
 }
 
@@ -79,6 +82,16 @@ pub(crate) fn split(
         .iter()
         .any(|operation| matches!(operation, PaintOperation::FastRoundedClip(_)))
     {
+        return None;
+    }
+    // [PiCell] A filter group's start and end markers must stay together, and a backdrop filter
+    // samples what is drawn before it: content holding either keeps its recorded scene.
+    if operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::Primitive(Primitive::BackdropFilter(_) | Primitive::FilterBoundary(_))
+        )
+    }) {
         return None;
     }
     // Every primitive in the order the renderer draws them: by draw order,

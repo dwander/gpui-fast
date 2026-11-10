@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
     SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -544,10 +544,24 @@ fn paint_line(
         align_width,
         wrap_boundaries,
     );
+    let text_system = cx.text_system().clone();
     window.paint_layer(line_bounds, |window| {
-        let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
-        let baseline_offset = point(px(0.), padding_top + layout.ascent);
-        let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
+        // Leading-trim (equivalent to CSS `text-box: trim-both cap alphabetic`): center the
+        // cap-height box in the line box rather than the full ascent+descent metric box. `ascent`
+        // includes diacritic/CJK clearance that visible glyphs never reach, so centering the metric
+        // box pushed text visibly low — worse for scripts with short ink (e.g. Latin lowercase).
+        let cap_height = layout
+            .runs
+            .first()
+            .map(|run| text_system.cap_height(run.font_id, layout.font_size))
+            .filter(|cap| *cap > px(0.))
+            // Fonts without a cap-height (some emoji/CJK faces) fall back to the previous
+            // ascent-based centering: (line_height + (ascent - descent)) / 2 == the old formula.
+            .unwrap_or(layout.ascent - layout.descent);
+        let baseline_offset = point(px(0.), (line_height + cap_height).half());
+        // Same descent factor as `text_system::underline_y_offset`, but measured from the
+        // leading-trimmed baseline above so the underline tracks the glyphs we actually paint.
+        let underline_y_offset = baseline_offset.y + (layout.descent * 0.618);
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -1022,7 +1036,7 @@ mod tests {
     use super::*;
     use crate::{
         AppContext as _, Context, FontId, GlyphId, IntoElement, Render, ShapedGlyph, ShapedRun,
-        Styled, TestAppContext, TextRun, Underline, canvas, font, hsla,
+        Styled, TestAppContext, TextRun, Underline, canvas, font, hsla, underline_y_offset,
     };
     use std::rc::Rc;
 

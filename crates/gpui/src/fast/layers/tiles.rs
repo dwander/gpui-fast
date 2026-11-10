@@ -292,7 +292,9 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
             // Atlas sprites keep this struct padding at zero; a dynamic
             // texture's sprite carries its content version, so a refreshed
             // texture dirties the tiles showing it.
-            hasher.write_u32(sprite.pad);
+            // [PiCell] The field is `pixelated` here: sampling flags below the version.
+            hasher.write_u32(sprite.pixelated);
+            hash_transformation(&sprite.transformation, hasher);
         }
         Primitive::Surface(surface) => {
             // A surface's pixels come from outside the scene; layers never
@@ -300,6 +302,19 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
             hasher.write_u8(7);
             hash_bounds(&surface.bounds, hasher);
             hash_mask(&surface.content_mask, tile, hasher);
+        }
+        // [PiCell] Layers never hold a blur filter (content holding one is drawn into the
+        // frame, see `paint.rs`), so these only need to hash apart.
+        Primitive::BackdropFilter(filter) => {
+            hasher.write_u8(8);
+            hash_bounds(&filter.bounds, hasher);
+            hash_mask(&filter.content_mask, tile, hasher);
+        }
+        Primitive::FilterBoundary(boundary) => {
+            hasher.write_u8(9);
+            hasher.write_u8(boundary.is_start as u8);
+            hash_bounds(&boundary.bounds, hasher);
+            hash_mask(&boundary.content_mask, tile, hasher);
         }
     }
 }

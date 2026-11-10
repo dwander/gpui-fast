@@ -270,6 +270,9 @@ fn draw_tile_scene(
             // The core keeps paths out of layers: a path rasterized into a
             // tile and moved by an odd number of pixels antialiases
             // differently. Metal draws no subpixel sprites.
+            // [PiCell] Layers never hold a blur filter: content holding one is drawn into the
+            // frame (gpui `fast/layers/paint.rs`).
+            PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => {}
             PrimitiveBatch::Paths(range) | PrimitiveBatch::SubpixelSprites { range, .. } => {
                 debug_assert!(
                     range.is_empty(),

@@ -226,10 +226,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       // used by browsers, but also avoids dashes from different segments
       // overlapping when dash size is smaller than the border width.
       //
-      // Dash pattern: (2 * border width) dash, (1 * border width) gap
-      const float dash_length_per_width = 2.0;
-      const float dash_gap_per_width = 1.0;
-      const float dash_period_per_width = dash_length_per_width + dash_gap_per_width;
+      // Dash pattern: (border_dashed_length * border width) dash,
+      // (border_dashed_gap * border width) gap. Both default to the
+      // browser-like 2 and 1.
+      float dash_length_per_width = quad.border_dashed_length;
+      float dash_gap_per_width = quad.border_dashed_gap;
+      float dash_period_per_width = dash_length_per_width + dash_gap_per_width;
 
       // Since the dash size is determined by border width, the density of
       // dashes varies. Multiplying a pixel distance by this returns a
@@ -238,7 +240,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       float dash_velocity = 0.0;
 
       // Dividing this by the border width gives the dash velocity
-      const float dv_numerator = 1.0 / dash_period_per_width;
+      float dv_numerator = 1.0 / dash_period_per_width;
 
       if (unrounded) {
         // When corners aren't rounded, the dashes are separately laid
@@ -542,13 +544,18 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     }
   }
 
+  // `saturate(0.5 -/+ d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+  float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                    shadow.element_corner_radii);
   if (shadow.inset != 0u) {
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
-    // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
-    alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
-    alpha *= saturate(0.5 - element_distance);
+    alpha = (1. - alpha) * saturate(0.5 - element_distance);
+  } else {
+    // A drop shadow is painted only *outside* the element, as CSS specifies — the border box is
+    // knocked out of it. Invisible under an opaque background, but decisive under a translucent
+    // one: otherwise the shadow lies beneath the panel and tints it, and a backdrop filter ends
+    // up frosting that dark blob instead of the content behind.
+    alpha *= saturate(0.5 + element_distance);
   }
 
   return input.color * float4(1., 1., 1., alpha);
@@ -675,6 +682,9 @@ fragment float4 monochrome_sprite_fragment(
 struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
+  // Position *before* the sprite transformation, so the rounded-corner SDF below stays in
+  // the sprite's own (unrotated) space. Identical to `position.xy` for a unit transform.
+  float2 local_position;
   uint sprite_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
@@ -682,6 +692,7 @@ struct PolychromeSpriteVertexOutput {
 struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
+  float2 local_position;
   uint sprite_id [[flat]];
 };
 
@@ -697,35 +708,143 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
   float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+                                                 sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float2 local_position =
+      unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height) +
+      float2(sprite.bounds.origin.x, sprite.bounds.origin.y);
   return PolychromeSpriteVertexOutput{
       device_position,
       tile_position,
+      local_position,
       sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Extended sRGB transfer (exact piecewise curve, continued above 1.0, sign-symmetric) — the
+// pow(2.2) helpers above are only an SDR approximation.
+float3 extended_srgb_to_linear(float3 v) {
+  float3 a = abs(v);
+  float3 l = select(pow((a + 0.055) / 1.055, 2.4), a / 12.92, a <= 0.04045);
+  return copysign(l, v);
+}
+
+float3 linear_to_extended_srgb(float3 l) {
+  float3 a = abs(l);
+  float3 v = select(1.055 * pow(a, 1.0 / 2.4) - 0.055, a * 12.92, a <= 0.0031308);
+  return copysign(v, l);
+}
+
+// Soft-clip an HDR (extended sRGB) colour into the display's current EDR headroom. Core
+// Graphics' tone mapping overshoots its target and the compositor hard-clips anything above the
+// headroom, flattening snow and clouds; from 80% of the headroom up we roll off with an
+// exponential knee that approaches the headroom asymptotically. Scaled by the max channel so
+// hue is preserved. Headroom 1.0 (no EDR) compresses everything into SDR.
+constant float HDR_SOFT_KNEE_START = 0.8;
+
+// Zoom at which a pixelated sprite switches to nearest sampling, measured in texels per device
+// pixel (1.0 = 100%, 0.5 = 200%). Exactly 100% is 1:1, so nearest is the original itself. Between
+// that and 200% one texel covers one and two device pixels by turns and lines look jagged, so those
+// zooms stay interpolated; nearest takes over from 200%.
+constant float PIXELATED_MAGNIFIED_TEXELS_PER_PIXEL = 0.5;
+// 0.5% slack so float/bounds-snapping error near 100% and 200% lands on the intended side.
+constant float PIXELATED_SLACK = 1.005;
+// PolychromeSprite::pixelated bits (same values as scene.rs).
+constant uint PIXELATED_FLAG = 1u;
+constant uint PIXEL_GRID_FLAG = 2u;
+constant uint PIXEL_GRID_DARK_FLAG = 4u;
+// Wide-gamut SDR in a float texture: values outside 0..1 are colours, not highlights — no soft clip.
+constant uint WIDE_GAMUT_FLAG = 8u;
+// Zoom (device pixels per texel) where the pixel grid starts to fade in / is fully shown
+// (700% / 900%). Computed from the zoom itself, so the fade needs no animation or extra frames.
+constant float PIXEL_GRID_FADE_START = 7.0;
+constant float PIXEL_GRID_FADE_END = 9.0;
+// How far a grid line pulls a pixel toward the line colour (white or black). The colour is one choice
+// per image — choosing it per pixel flips it across mid-tone gradients and looks scaly (the app picks
+// it from the image's brightness).
+constant float PIXEL_GRID_STRENGTH = 0.25;
+
+// Lays the grid on the first device-pixel row/column of each texel (its left/top edge). `texel_step`
+// is the texel advance per device pixel (fwidth). Nearest sampling paints the texel under each pixel
+// centre, so block edges already sit on device-pixel edges; marking that first row keeps the line a
+// crisp 1px even at fractional zooms.
+float3 apply_pixel_grid(float3 rgb, float2 texel_pos, float2 texel_step,
+                        float texels_per_pixel, bool dark) {
+  float fade = saturate((1.0 / max(texels_per_pixel, 1e-6) - PIXEL_GRID_FADE_START) /
+                        (PIXEL_GRID_FADE_END - PIXEL_GRID_FADE_START));
+  float2 f = fract(texel_pos);
+  float2 px_step = max(texel_step, float2(1e-6));
+  float2 from_start = f / px_step;
+  float line_cover = any(from_start < 1.0) ? fade : 0.0;
+  float3 target = dark ? float3(0.0) : float3(1.0);
+  return mix(rgb, target, line_cover * PIXEL_GRID_STRENGTH);
+}
+
+// Whether a pixelated sprite takes the nearest texel at this zoom — exactly 100%, or 200% and up.
+bool pixelated_nearest(float texels_per_pixel) {
+  bool at_native = texels_per_pixel <= PIXELATED_SLACK && texels_per_pixel * PIXELATED_SLACK >= 1.0;
+  return at_native || texels_per_pixel <= PIXELATED_MAGNIFIED_TEXELS_PER_PIXEL * PIXELATED_SLACK;
+}
+
+float3 compress_to_headroom(float3 rgb, float headroom) {
+  float knee = headroom * HDR_SOFT_KNEE_START;
+  float range = headroom - knee;
+  float3 lin = extended_srgb_to_linear(rgb);
+  float m = max(lin.r, max(lin.g, lin.b));
+  if (m <= knee || range <= 0.0) {
+    return rgb;
+  }
+  float squashed = knee + range * (1.0 - exp(-(m - knee) / range));
+  return linear_to_extended_srgb(lin * (squashed / m));
 }
 
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant HdrParams &hdr [[buffer(SpriteInputIndex_HdrParams)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  // Pixelated: at 100% and from 200% up, take the nearest texel as-is instead of interpolating
+  // (`pixelated_nearest`). Minified sprites and the zooms in between keep the filtered sample
+  // above. Derivatives stay outside the branch.
+  float2 atlas_dims = float2(float(atlas_texture.get_width()),
+                             float(atlas_texture.get_height()));
+  float2 texel_pos = input.tile_position * atlas_dims;
+  float texels_per_pixel = max(length(dfdx(texel_pos)), length(dfdy(texel_pos)));
+  float2 texel_step = fwidth(texel_pos);
+  bool nearest = (sprite.pixelated & PIXELATED_FLAG) != 0u &&
+                 pixelated_nearest(texels_per_pixel);
+  if (nearest) {
+    float2 tile_min =
+        float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y) + 0.5;
+    float2 tile_max =
+        tile_min +
+        float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height) - 1.0;
+    float2 nearest = clamp(floor(texel_pos) + 0.5, tile_min, tile_max) / atlas_dims;
+    sample = atlas_texture.sample(atlas_texture_sampler, nearest, level(0.0));
+  }
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
+  if (hdr.is_hdr > 0.5 && (sprite.pixelated & WIDE_GAMUT_FLAG) == 0u) {
+    color.rgb = compress_to_headroom(color.rgb, hdr.headroom);
+  }
   if (sprite.grayscale) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.r = grayscale;
     color.g = grayscale;
     color.b = grayscale;
+  }
+  if (nearest && (sprite.pixelated & PIXEL_GRID_FLAG) != 0u) {
+    color.rgb = apply_pixel_grid(color.rgb, texel_pos, texel_step, texels_per_pixel,
+                                 (sprite.pixelated & PIXEL_GRID_DARK_FLAG) != 0u);
   }
   color.a *= sprite.opacity * saturate(0.5 - distance);
   return color;
@@ -1144,6 +1263,12 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
 float4 over(float4 below, float4 above) {
   float4 result;
   float alpha = above.a + below.a * (1.0 - above.a);
+  // Both layers fully transparent (e.g. a dash gap on a border-only quad) would be 0/0 = NaN. An
+  // 8-bit target silently writes that as 0, but a float target keeps it, and a blur over it then
+  // smears the NaN into a solid box.
+  if (alpha <= 0.0) {
+    return float4(0.0);
+  }
   result.rgb =
       (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
   result.a = alpha;
@@ -1276,4 +1401,151 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+// --- blur --- //
+//
+// Shared by backdrop (`backdrop-filter`) and content (`filter`) blur. Three passes:
+// downsample (full -> half res), separable gaussian (run twice), and a composite that
+// samples the blurred texture into a rounded rectangle. `BlurParams` is supplied via
+// `setFragmentBytes`/`setVertexBytes` and mirrors the Rust `BlurUniform` struct exactly.
+//
+// Buffer/texture indices (raw, matching gpui_macos::metal_renderer::BlurInputIndex):
+//   buffer(0) = unit vertices, buffer(1) = BlurParams, buffer(2) = viewport size
+//   texture(0) = source
+
+struct BlurParams {
+  Bounds_ScaledPixels bounds;
+  Bounds_ScaledPixels content_mask;
+  Corners_ScaledPixels corner_radii;
+  float2 direction;
+  float sigma;
+  float opacity;
+  float tap_count;
+  float clip_rounded;
+  // 1.0 = snapped 2:1 box downsample (anchor the half-res grid to a fixed 2px grid at the origin
+  // so a stationary element blurs identically at every window size); 0.0 = 1:1 copy (scene blit).
+  float downsample;
+  // Spacing between taps in pixels (gaussian passes only); >1 lets `tap_count` taps span very
+  // large radii without truncating the gaussian.
+  float tap_step;
+  // Composite pass only: resample the source about `scale_anchor` by this factor (1.0 = 1:1).
+  // This is how `Styled::appear_scale` scales an isolated group.
+  float scale;
+  // Composite pass only: how many source texels one screen pixel spans — 2.0 for the half-res
+  // blur textures, 1.0 when compositing a full-resolution (unblurred) group.
+  float source_texel_scale;
+  // Composite pass only: the point `scale` scales about, in scene pixels. Lands at an 8-byte
+  // aligned offset, so it matches the Rust `[f32; 2]` with no padding inserted.
+  float2 scale_anchor;
+};
+
+struct BlurVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+};
+
+vertex BlurVertexOutput blur_fullscreen_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]]) {
+  float2 uv = unit_vertices[unit_vertex_id];
+  BlurVertexOutput out;
+  out.position = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  out.uv = uv;
+  return out;
+}
+
+fragment float4 blur_downsample_fragment(
+    BlurVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    constant BlurParams &params [[buffer(1)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear);
+  if (params.downsample > 0.5) {
+    // Snapped 2:1 box downsample. Half-res texel `px` samples source at full-res coordinate
+    // 2*px + 1 (the boundary between source texels 2*px and 2*px+1), so one bilinear tap averages
+    // exactly that pair. Anchored to the origin and independent of the viewport size, so an element
+    // at fixed pixels blurs identically at every window size — otherwise the implicit floor(W/2)
+    // grid stretches and the halo wobbles by ~1px on resize. Uses the source's own dimensions
+    // because this pass binds the half-res target size as the viewport.
+    float2 dst = floor(input.position.xy);
+    float2 src_size = float2(float(source.get_width()), float(source.get_height()));
+    float2 src_uv = (dst * 2.0 + 1.0) / src_size;
+    return source.sample(s, src_uv);
+  }
+  // 1:1 copy at matching resolution (used to blit the offscreen scene into the drawable).
+  return source.sample(s, input.uv);
+}
+
+fragment float4 blur_fragment(
+    BlurVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    constant BlurParams &params [[buffer(1)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear);
+  int taps = int(params.tap_count);
+  float4 color = float4(0.0);
+  float weight_sum = 0.0;
+  for (int i = -taps; i <= taps; i++) {
+    float offset = float(i) * params.tap_step;
+    float w = gaussian(offset, params.sigma);
+    color += source.sample(s, input.uv + params.direction * offset) * w;
+    weight_sum += w;
+  }
+  return color / max(weight_sum, 1e-5);
+}
+
+struct BlurCompositeVertexOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BlurCompositeFragmentInput {
+  float4 position [[position]];
+};
+
+vertex BlurCompositeVertexOutput blur_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    constant BlurParams &params [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BlurCompositeVertexOutput out;
+  out.position = to_device_position(unit_vertex, params.bounds, viewport_size);
+  float4 clip = distance_from_clip_rect(unit_vertex, params.bounds, params.content_mask);
+  out.clip_distance[0] = clip.x;
+  out.clip_distance[1] = clip.y;
+  out.clip_distance[2] = clip.z;
+  out.clip_distance[3] = clip.w;
+  return out;
+}
+
+fragment float4 blur_composite_fragment(
+    BlurCompositeFragmentInput input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    constant BlurParams &params [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear);
+  // Scaling a group is a source-side coordinate change: the pixel at `p` shows the point the
+  // unscaled group had at `anchor + (p - anchor) / scale`.
+  float2 source_position =
+      params.scale_anchor + (input.position.xy - params.scale_anchor) / params.scale;
+  // Sample the half-res blur by screen position, on the SAME fixed 2:1 grid the snapped downsample
+  // wrote (anchored at the origin, independent of viewport parity): 2 * the half-res texture size
+  // maps screen pixel p to half-res texel p/2 at every window size, so it doesn't wobble on resize.
+  // An unblurred group is full-resolution instead, hence the texel scale rather than a literal 2.
+  float2 source_size = float2(float(source.get_width()), float(source.get_height()));
+  float2 uv = source_position / (params.source_texel_scale * source_size);
+  float4 blurred = source.sample(s, uv);
+  // The scene is premultiplied; alpha never legitimately exceeds 1 (the float target does not
+  // clamp for us the way an 8-bit one did).
+  blurred.a = min(blurred.a, 1.0);
+  // Backdrop clips to the rounded rect (the panel has a defined shape); content blur bleeds past
+  // its bounds like CSS `filter: blur`, so its shape comes from the blurred group's own alpha.
+  float dist = quad_sdf(input.position.xy, params.bounds, params.corner_radii);
+  float coverage = params.clip_rounded > 0.5 ? saturate(0.5 - dist) : 1.0;
+  // The blurred sample is premultiplied (blurring against the transparent surround scales rgb with
+  // the fading alpha), so output premultiplied and use a premultiplied-blend pipeline. A backdrop's
+  // scene is opaque (so this replaces); a content-filter group is transparent outside its subtree
+  // (so the target shows through there instead of darkening).
+  float a = coverage * params.opacity;
+  return float4(blurred.rgb * a, blurred.a * a);
 }

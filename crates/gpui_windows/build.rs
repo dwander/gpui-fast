@@ -43,6 +43,10 @@ mod shader_compilation {
             "monochrome_sprite",
             "subpixel_sprite",
             "polychrome_sprite",
+            "blur_downsample",
+            "blur",
+            "blur_composite",
+            "hdr_output",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

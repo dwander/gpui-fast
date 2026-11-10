@@ -6,6 +6,7 @@
 
 mod display;
 mod display_link;
+mod custom_cursor;
 mod events;
 mod fast;
 mod keyboard;
@@ -43,7 +44,9 @@ pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use window::*;
 
+pub use events::{keypad_nav_mode, set_keypad_nav_mode};
 pub use platform::MacPlatform;
+pub use window::set_drag_move_is_default;
 
 trait BoolExt {
     fn to_objc(self) -> Bool;

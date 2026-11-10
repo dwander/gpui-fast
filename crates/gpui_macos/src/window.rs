@@ -472,6 +472,11 @@ unsafe fn build_window_class(name: &CStr, superclass: &AnyClass) -> *const AnyCl
         decl.add_method(sel!(close), close_window as extern "C" fn(_, Sel));
 
         decl.add_method(
+            sel!(animationResizeTime:),
+            animation_resize_time as extern "C" fn(_, Sel, NSRect) -> f64,
+        );
+
+        decl.add_method(
             sel!(draggingEntered:),
             dragging_entered as extern "C" fn(_, Sel, *mut AnyObject) -> NSDragOperation,
         );
@@ -658,6 +663,10 @@ pub(crate) struct MacWindowState {
     pub(crate) fast_composition: crate::fast::composition::MacComposition,
     blurred_view: Option<*mut AnyObject>,
     background_appearance: WindowBackgroundAppearance,
+    /// Whether the layer currently presents EDR content (`set_hdr_content`); deduplicates calls.
+    hdr_content: bool,
+    /// Headroom last handed to the renderer (`set_hdr_content`); deduplicates calls.
+    hdr_headroom: f32,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: FrameSource,
@@ -797,6 +806,18 @@ impl MacWindowState {
         })
     }
 
+    /// Hide the minimize and zoom traffic-light buttons, leaving only close.
+    ///
+    /// Dropping `NSMiniaturizable`/`NSResizable` from the style mask only *disables* those buttons
+    /// (they stay visible, greyed out). A close-only dialog wants them gone, so hide them outright.
+    /// Resizing via window edges still works even with the zoom button hidden.
+    fn hide_minimize_and_zoom_buttons(&self) {
+        if let Some(buttons) = self.traffic_light_buttons() {
+            buttons.minimize.setHidden(true);
+            buttons.zoom.setHidden(true);
+        }
+    }
+
     fn titlebar_container(close_button: &NSButton) -> Option<Retained<NSView>> {
         // SAFETY: `close_button` comes from AppKit's `standardWindowButton(_:)`.
         // Although `superview` is unsafe, objc2 returns each result as `Retained<NSView>`.
@@ -886,18 +907,20 @@ impl MacWindowState {
         }
     }
 
+    /// Whether the window is zoomed, which is what "maximized" means on macOS.
+    ///
+    /// This asks AppKit (`-[NSWindow isZoomed]`) instead of comparing the window's size
+    /// against the screen's visible frame, so that it agrees with [`Self::zoom`] below —
+    /// that is `-[NSWindow zoom:]`, a *toggle* AppKit decides from this very flag (the
+    /// window's whole frame, position included, against its standard frame).
+    ///
+    /// A size-only comparison disagrees with it for a window that is as large as the
+    /// visible frame but sits somewhere else, and a caller that gates a zoom on
+    /// `is_maximized()` then gets the opposite of what it asked for: it reads "maximized",
+    /// calls `zoom()` to undo it, and AppKit — which does not consider the window zoomed —
+    /// maximizes it instead.
     fn is_maximized(&self) -> bool {
-        fn rect_to_size(rect: NSRect) -> Size<Pixels> {
-            let NSSize { width, height } = rect.size;
-            size(width.into(), height.into())
-        }
-
-        let bounds = self.bounds();
-        let screen_frame = self
-            .native_window()
-            .screen()
-            .map_or_default(|screen| screen.visibleFrame());
-        bounds.size == rect_to_size(screen_frame)
+        self.native_window().isZoomed()
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -1019,6 +1042,7 @@ impl MacWindow {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::NO];
             }
 
+            let has_titlebar = titlebar.is_some();
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
                 style_mask = NSWindowStyleMask::Closable | NSWindowStyleMask::Titled;
@@ -1124,6 +1148,8 @@ impl MacWindow {
                 ),
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
+                hdr_content: false,
+                hdr_headroom: 1.0,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: match &metal_frames {
@@ -1333,6 +1359,11 @@ impl MacWindow {
             {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
+                // A non-minimizable titled window is treated as a close-only dialog: hide the
+                // minimize and zoom buttons so only close remains (edge-resize is unaffected).
+                if has_titlebar && !is_minimizable {
+                    window_state.hide_minimize_and_zoom_buttons();
+                }
                 window_state.sheet_parent = sheet_parent;
             }
 
@@ -1483,6 +1514,37 @@ impl PlatformWindow for MacWindow {
                         width: size.width.as_f32() as f64,
                         height: size.height.as_f32() as f64,
                     }];
+                })
+            })
+            .detach();
+    }
+
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        let this = self.0.lock();
+        let window = this.native_window;
+        let closed = this.closed.clone();
+        this.foreground_executor
+            .spawn(async move {
+                if_window_not_closed(closed, || {
+                    // SAFETY: as in `MacWindowState::native_window`, this is an `NSWindow` or
+                    // `NSPanel`, and the window is still open.
+                    let window = unsafe { &*window.cast::<NSWindow>() };
+                    let Some(screen) = window.screen() else {
+                        return;
+                    };
+                    // Exact inverse of `MacWindowState::bounds`, so a set/get round trip agrees:
+                    // frame coordinates, bottom-left origin, relative to the window's screen.
+                    let screen_frame = screen.frame();
+                    let flipped_y = bounds.origin.y.as_f32() as f64 - screen_frame.origin.y;
+                    let height = bounds.size.height.as_f32() as f64;
+                    let frame = NSRect::new(
+                        NSPoint::new(
+                            screen_frame.origin.x + bounds.origin.x.as_f32() as f64,
+                            screen_frame.size.height - flipped_y - height,
+                        ),
+                        NSSize::new(bounds.size.width.as_f32() as f64, height),
+                    );
+                    window.setFrame_display(frame, true);
                 })
             })
             .detach();
@@ -1670,6 +1732,30 @@ impl PlatformWindow for MacWindow {
         let mut state = self.0.lock();
         state.traffic_light_position = Some(position);
         state.move_traffic_light();
+    }
+
+    fn set_traffic_lights_dimmed(&self, dimmed: bool) {
+        // Fade the whole button cluster so it reads as "behind" the modal backdrop. AppKit still
+        // repaints each button's glyph, so setting the container's alpha is the one place that
+        // stays dim; per-button alpha gets clobbered on the next hover/redraw.
+        let alpha = if dimmed { 0.35 } else { 1.0 };
+        let state = self.0.lock();
+        if let Some(buttons) = state.traffic_light_buttons()
+            && let Some(container) = MacWindowState::titlebar_container(&buttons.close)
+        {
+            container.setAlphaValue(alpha);
+        }
+    }
+
+    fn set_traffic_lights_hidden(&self, hidden: bool) {
+        // Same container as dimming: hiding it takes the buttons out of hit testing as well, so
+        // an invisible close button can't be clicked by accident.
+        let state = self.0.lock();
+        if let Some(buttons) = state.traffic_light_buttons()
+            && let Some(container) = MacWindowState::titlebar_container(&buttons.close)
+        {
+            container.setHidden(hidden);
+        }
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1888,6 +1974,16 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_app_id(&mut self, _app_id: &str) {}
+
+    fn set_hdr_content(&self, enabled: bool, headroom: f32) {
+        let mut this = self.0.as_ref().lock();
+        if this.hdr_content == enabled && this.hdr_headroom == headroom {
+            return;
+        }
+        this.hdr_content = enabled;
+        this.hdr_headroom = headroom;
+        this.renderer.set_wants_hdr(enabled, headroom);
+    }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
@@ -2551,6 +2647,16 @@ pub(crate) unsafe fn drop_window_state(object: &AnyObject) {
     }
 }
 
+// Window resize animations are disabled: `zoom:` (the green traffic-light button, a titlebar
+// double-click) and any `setFrame:display:animate:YES` finish in a single frame.
+//
+// AppKit's default is a frame animation of roughly a fifth of a second, and every step of it
+// re-lays-out the window's content. That is plainly visible in content that scales with the
+// window - an image view stretches and settles instead of simply appearing at its new size.
+extern "C" fn animation_resize_time(_: &AnyObject, _: Sel, _: NSRect) -> f64 {
+    0.0
+}
+
 extern "C" fn yes(_: &AnyObject, _: Sel) -> Bool {
     Bool::YES
 }
@@ -2635,6 +2741,9 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            // 등록된 커스텀 이미지 커서를 id 로 조회 (없으면 화살표).
+            CursorStyle::Custom(id) => crate::custom_cursor::get(id)
+                .unwrap_or_else(|| msg_send![class!(NSCursor), arrowCursor]),
         };
 
         let bounds: NSRect = msg_send![this, bounds];
@@ -2797,9 +2906,18 @@ extern "C" fn handle_key_event(
                 })
                 .unwrap_or(false);
 
+            // 키패드 내비 모드로 이름이 바뀐 키는 IME 를 건너뛰고 곧장 키맵으로 보낸다 —
+            // 원본 이벤트의 문자가 인쇄 가능해서 `insertText:` 로 삼켜지기 때문이다
+            // (`events::is_keypad_event` 에 자세히). 조합 중일 때는 IME 몫이 먼저다.
+            // SAFETY: AppKit hands key-event handlers an `NSEvent`.
+            let is_keypad = crate::events::is_keypad_event(unsafe {
+                &*native_event.cast::<objc2_app_kit::NSEvent>()
+            });
+
             if is_composing
                 || is_ime_printable_key
-                || (key_down_event.keystroke.key_char.is_none()
+                || (!is_keypad
+                    && key_down_event.keystroke.key_char.is_none()
                     && !key_down_event.keystroke.modifiers.control
                     && !key_down_event.keystroke.modifiers.function
                     && !key_down_event.keystroke.modifiers.platform)
@@ -3811,16 +3929,36 @@ extern "C" fn conclude_drag_operation(this: &AnyObject, _: Sel, _: *mut AnyObjec
     send_file_drop_event(window_state, FileDropEvent::Exited);
 }
 
+/// What a modifier-free drop means to the host app: `true` = move, `false` = copy.
+///
+/// Outside the application this is not cosmetic. The destination picks the operation out of what
+/// the source allows, so offering move makes Finder move the files on a plain same-volume drop.
+/// Offering copy alone keeps a bare drop a copy, which is what an app whose default is copy means.
+static DRAG_MOVE_IS_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// Sets what a modifier-free drop means to the host app, so an outbound drag offers the matching
+/// operation. Apps that treat a plain drop as a copy (the default) never need to call this.
+pub fn set_drag_move_is_default(is_move: bool) {
+    DRAG_MOVE_IS_DEFAULT.store(is_move, Ordering::Relaxed);
+}
+
 extern "C" fn dragging_session_source_operation_mask(
     _: &AnyObject,
     _: Sel,
     _: *mut AnyObject,
     context: NSDraggingContext,
 ) -> NSDragOperation {
-    let operation = match context {
-        NSDraggingContext::OutsideApplication => NSDragOperation::Copy,
-        NSDraggingContext::WithinApplication => NSDragOperation::Copy | NSDragOperation::Move,
-        _ => NSDragOperation::Copy | NSDragOperation::Move,
+    // The destination decides which of the offered operations it performs, so what we offer is what
+    // a bare drop does. Offer move only when the host app says a plain drop means move - otherwise
+    // Finder would move the files on a same-volume drop even though the app's default is copy.
+    // The user can still reach the other operation with the standard modifiers.
+    //
+    // Either way the source never deletes anything: outside the application the destination carries
+    // out the move, and only NSDragOperationDelete (a drag to the Trash) asks the source to remove.
+    let operation = if DRAG_MOVE_IS_DEFAULT.load(Ordering::Relaxed) {
+        NSDragOperation::Copy | NSDragOperation::Move
+    } else {
+        NSDragOperation::Copy
     };
     log::debug!(
         "dragging_session_source_operation_mask: context={}, operation={}",

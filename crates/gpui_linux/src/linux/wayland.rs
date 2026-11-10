@@ -38,5 +38,7 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+        // 커스텀 이미지 커서는 아직 Linux 미구현 → 기본 커서 폴백.
+        CursorStyle::Custom(_) => Shape::Default,
     }
 }
