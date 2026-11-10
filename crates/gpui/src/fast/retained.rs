@@ -412,6 +412,8 @@ impl PaintIndex {
                     + to.fast.window_control_hitboxes,
                 a11y_actions: self.fast.a11y_actions - from.fast.a11y_actions
                     + to.fast.a11y_actions,
+                hdr_requests: self.fast.hdr_requests - from.fast.hdr_requests
+                    + to.fast.hdr_requests,
             },
             mouse_listeners_index: self.mouse_listeners_index - from.mouse_listeners_index
                 + to.mouse_listeners_index,
@@ -1204,6 +1206,8 @@ impl Window {
 pub(crate) struct FastPaintIndex {
     pub(crate) window_control_hitboxes: usize,
     pub(crate) a11y_actions: usize,
+    /// [PiCell] `Frame::hdr_requests`.
+    pub(crate) hdr_requests: usize,
 }
 
 impl FastPaintIndex {
@@ -1212,6 +1216,7 @@ impl FastPaintIndex {
         FastPaintIndex {
             window_control_hitboxes: window.next_frame.window_control_hitboxes.len(),
             a11y_actions: crate::fast::a11y::actions_index(window),
+            hdr_requests: window.next_frame.hdr_requests.len(),
         }
     }
 }
@@ -1229,6 +1234,10 @@ pub(crate) fn reuse_paint_records(window: &mut Window, range: &Range<PaintIndex>
             .cloned(),
     );
     crate::fast::a11y::reuse_paint(window, range);
+    // [PiCell] A reused subtree still shows its HDR image: keep asking for HDR output.
+    let reused = &window.rendered_frame.hdr_requests
+        [range.start.fast.hdr_requests..range.end.fast.hdr_requests];
+    window.next_frame.hdr_requests.extend_from_slice(reused);
 }
 
 /// The retained subtrees around the element being painted, for a listener

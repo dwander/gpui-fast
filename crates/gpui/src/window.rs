@@ -1060,6 +1060,10 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// Headrooms asked for by [`Window::set_hdr_content`] while painting this frame. A list in
+    /// paint order — not a single value — so a subtree drawn again from the last frame copies its
+    /// requests with the rest of its paint (`fast::retained::reuse_paint_records`).
+    pub(crate) hdr_requests: Vec<f32>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1121,6 +1125,7 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            hdr_requests: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1147,6 +1152,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.hdr_requests.clear();
         self.hitboxes.clear();
         crate::fast::composition::SurfaceInput::clear(&mut self.fast_composition_input);
         self.window_control_hitboxes.clear();
@@ -1275,10 +1281,6 @@ pub struct Window {
     /// drag. Recomputed from scratch every draw; pushed to the platform window (which may use it
     /// to show a "not allowed" drag cursor) on every frame drawn while a drag is in flight.
     pub(crate) drop_target_hovered: bool,
-    /// The headroom of the HDR content requested while drawing this frame (`None` = none), via
-    /// [`Window::set_hdr_content`]. Cleared every draw and pushed to the platform window after it,
-    /// so HDR presentation ends with the last frame that asked for it.
-    hdr_content: Cell<Option<f32>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
     /// input session can restart the IME connection).
@@ -2413,7 +2415,6 @@ impl Window {
             element_opacity: 1.0,
             requested_autoscroll: None,
             drop_target_hovered: false,
-            hdr_content: Cell::new(None),
             last_text_input_configuration: None,
             focused_text_input: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3362,8 +3363,8 @@ impl Window {
     /// HDR image (`RenderImage::new_hdr`), every frame you do; a frame without such a call — the
     /// image changed, its view was hidden or dropped — ends HDR presentation, so the display only
     /// stays in extended range while there is something to show. `false` asks for nothing
-    /// (another element may still ask). Calls outside a draw, or from a view replayed from cache,
-    /// don't count.
+    /// (another element may still ask). Calls outside a draw don't count; a view drawn again from
+    /// the last frame without painting keeps the requests it painted then.
     ///
     /// Only a **visible** request counts: called during paint, the current content mask has to
     /// meet the window. Ask from inside the bounds showing the image (`with_content_mask`) and an
@@ -3373,7 +3374,7 @@ impl Window {
     /// `headroom` is the display's current headroom (multiples of SDR white): HDR images are
     /// soft-clipped into it each frame, so pass the live value. A no-op on platforms without HDR
     /// presentation.
-    pub fn set_hdr_content(&self, enabled: bool, headroom: f32) {
+    pub fn set_hdr_content(&mut self, enabled: bool, headroom: f32) {
         let window = Bounds {
             origin: Point::default(),
             size: self.viewport_size,
@@ -3383,8 +3384,7 @@ impl Window {
             .last()
             .is_none_or(|mask| mask.bounds.intersects(&window));
         if enabled && visible {
-            let headroom = self.hdr_content.get().map_or(headroom, |h| h.max(headroom));
-            self.hdr_content.set(Some(headroom));
+            self.next_frame.hdr_requests.push(headroom);
         }
     }
 
@@ -3794,9 +3794,8 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             // Rebuilt by the views drawn below (see `Window::set_hdr_content`).
-            self.hdr_content.set(None);
             self.draw_roots(cx);
-            let hdr_headroom = self.hdr_content.get();
+            let hdr_headroom = self.next_frame.hdr_requests.iter().copied().reduce(f32::max);
             self.platform_window
                 .set_hdr_content(hdr_headroom.is_some(), hdr_headroom.unwrap_or(1.0));
             #[cfg(feature = "profiler")]
