@@ -123,7 +123,8 @@ fn scenes(tiles: &[TileCoord], nudge: f32) -> (Scene, Scene) {
         let bounds = frame.tile_bounds(tile);
         layered.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            pixelated: 0,
+            transformation: crate::TransformationMatrix::unit(),
             grayscale: false.into(),
             opacity: 1.,
             bounds: Bounds {

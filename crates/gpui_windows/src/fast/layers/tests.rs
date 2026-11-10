@@ -270,7 +270,8 @@ fn composited_scene(
         let bounds = layer.tile_bounds(tile);
         composited.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            pixelated: 0,
+            transformation: TransformationMatrix::unit(),
             grayscale: false.into(),
             opacity: 1.,
             bounds: sp(
@@ -445,7 +446,8 @@ fn rasterize_and_assemble(harness: &mut Harness, content: Scene, tiles: &[(i32, 
         let bounds = layer.tile_bounds(tile);
         frame.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            pixelated: 0,
+            transformation: TransformationMatrix::unit(),
             grayscale: false.into(),
             opacity: 1.,
             bounds,
@@ -624,7 +626,8 @@ fn add_content(
     });
     scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: 0,
+        pixelated: 0,
+        transformation: TransformationMatrix::unit(),
         grayscale: false.into(),
         opacity: 1.,
         bounds: at(300., 500., 20., 20.),
@@ -723,6 +726,7 @@ fn image_tile(harness: &Harness) -> AtlasTile {
     let key = AtlasKey::Image(RenderImageParams {
         image_id: ImageId(9_999),
         frame_index: 0,
+        hdr: false,
     });
     let bytes: Vec<u8> = (0..20 * 20)
         .flat_map(|i: u32| {

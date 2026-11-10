@@ -1,6 +1,6 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    SharedString, StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -518,6 +518,30 @@ impl WrappedLine {
     }
 }
 
+/// [PiCell] Leading-trim (equivalent to CSS `text-box: trim-both cap alphabetic`): the baseline
+/// that centers the cap-height box in the line box rather than the full ascent+descent metric
+/// box. `ascent` includes diacritic/CJK clearance that visible glyphs never reach, so centering
+/// the metric box pushed text visibly low — worse for scripts with short ink (e.g. Latin
+/// lowercase).
+fn trimmed_baseline_y(layout: &LineLayout, line_height: Pixels, text_system: &TextSystem) -> Pixels {
+    let cap_height = layout
+        .runs
+        .first()
+        .map(|run| text_system.cap_height(run.font_id, layout.font_size))
+        .filter(|cap| *cap > px(0.))
+        // Fonts without a cap-height (some emoji/CJK faces) fall back to the previous
+        // ascent-based centering: (line_height + (ascent - descent)) / 2 == the old formula.
+        .unwrap_or(layout.ascent - layout.descent);
+    (line_height + cap_height).half()
+}
+
+/// [PiCell] Where the painter puts underlines: upstream's descent factor
+/// (`text_system::underline_y_offset`), measured from [`trimmed_baseline_y`] so the underline
+/// tracks the glyphs we actually paint. Underline handlers report this same y.
+fn trimmed_underline_y(layout: &LineLayout, line_height: Pixels, text_system: &TextSystem) -> Pixels {
+    trimmed_baseline_y(layout, line_height, text_system) + layout.descent * 0.618
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -546,22 +570,10 @@ fn paint_line(
     );
     let text_system = cx.text_system().clone();
     window.paint_layer(line_bounds, |window| {
-        // Leading-trim (equivalent to CSS `text-box: trim-both cap alphabetic`): center the
-        // cap-height box in the line box rather than the full ascent+descent metric box. `ascent`
-        // includes diacritic/CJK clearance that visible glyphs never reach, so centering the metric
-        // box pushed text visibly low — worse for scripts with short ink (e.g. Latin lowercase).
-        let cap_height = layout
-            .runs
-            .first()
-            .map(|run| text_system.cap_height(run.font_id, layout.font_size))
-            .filter(|cap| *cap > px(0.))
-            // Fonts without a cap-height (some emoji/CJK faces) fall back to the previous
-            // ascent-based centering: (line_height + (ascent - descent)) / 2 == the old formula.
-            .unwrap_or(layout.ascent - layout.descent);
-        let baseline_offset = point(px(0.), (line_height + cap_height).half());
+        let baseline_offset = point(px(0.), trimmed_baseline_y(layout, line_height, &text_system));
         // Same descent factor as `text_system::underline_y_offset`, but measured from the
         // leading-trimmed baseline above so the underline tracks the glyphs we actually paint.
-        let underline_y_offset = baseline_offset.y + (layout.descent * 0.618);
+        let underline_y_offset = trimmed_underline_y(layout, line_height, &text_system);
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -1036,7 +1048,7 @@ mod tests {
     use super::*;
     use crate::{
         AppContext as _, Context, FontId, GlyphId, IntoElement, Render, ShapedGlyph, ShapedRun,
-        Styled, TestAppContext, TextRun, Underline, canvas, font, hsla, underline_y_offset,
+        Styled, TestAppContext, TextRun, Underline, canvas, font, hsla,
     };
     use std::rc::Rc;
 
@@ -1238,7 +1250,7 @@ mod tests {
                     )
                     .unwrap();
                     let start = px(origin_x + offset);
-                    let y = origin.y + underline_y_offset(line_height, line.ascent, line.descent);
+                    let y = origin.y + trimmed_underline_y(&line.layout, line_height, cx.text_system());
                     assert_eq!(
                         strokes,
                         [
@@ -1324,7 +1336,7 @@ mod tests {
                 / 2.;
             let origin = point(px(40.25), px(10.25));
             let line_height = px(20.);
-            let y = origin.y + underline_y_offset(line_height, line.ascent, line.descent);
+            let y = origin.y + trimmed_underline_y(&line.layout, line_height, cx.text_system());
             for (align, offset) in [
                 (TextAlign::Left, 0.),
                 (TextAlign::Center, 16.),
@@ -1393,7 +1405,7 @@ mod tests {
                     / 2.;
                 let origin = point(px(40.25), px(10.25));
                 let line_height = px(20.);
-                let y = origin.y + underline_y_offset(line_height, line.ascent, line.descent);
+                let y = origin.y + trimmed_underline_y(&line.layout, line_height, cx.text_system());
                 let wrapped = WrappedLine {
                     layout: Arc::new(WrappedLineLayout {
                         unwrapped_layout: line.layout,

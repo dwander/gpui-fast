@@ -439,7 +439,8 @@ fn translation_moves_every_position_a_primitive_carries() {
 
     let poly = PolychromeSprite {
         order: 0,
-        pad: 0,
+        pixelated: 0,
+        transformation: crate::TransformationMatrix::unit(),
         grayscale: false.into(),
         opacity: 1.,
         bounds: sp(1., 2., 3., 4.),

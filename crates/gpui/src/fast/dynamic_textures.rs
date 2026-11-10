@@ -851,12 +851,13 @@ mod tests {
 
     /// A scene holding the texture painted over `region`'s tiles, the way
     /// [`paint`] would build it: the version the texture carries at paint
-    /// time rides in the sprite's pad.
-    fn scene_with_texture(texture: DynamicTexture, pad: u32) -> Scene {
+    /// time rides in the sprite's pad ([PiCell] `pixelated`, above our filter bits).
+    fn scene_with_texture(texture: DynamicTexture, version: u32) -> Scene {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad,
+            pixelated: version << super::PAINTED_VERSION_SHIFT,
+            transformation: crate::TransformationMatrix::unit(),
             tile: AtlasTile {
                 texture_id: texture.id.atlas_texture_id(),
                 tile_id: TileId(texture.id.0),
