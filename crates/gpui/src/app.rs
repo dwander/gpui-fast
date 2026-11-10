@@ -2582,7 +2582,7 @@ impl App {
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
-        crate::fast::stats::picell_note_global_write(type_name::<G>());
+        crate::fast::stats::picell_note_global_write(type_name::<G>(), global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
             .get_mut(&global_type)
@@ -2592,9 +2592,10 @@ impl App {
 
     /// Access the global of the given type mutably. A default value is assigned if a global of this type has not
     /// yet been assigned.
+    #[track_caller]
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
-        crate::fast::stats::picell_note_global_write(type_name::<G>());
+        crate::fast::stats::picell_note_global_write(type_name::<G>(), global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         crate::fast::dependencies::note_global_inserted::<G>(self);
         self.globals_by_type
@@ -2605,9 +2606,10 @@ impl App {
     }
 
     /// Sets the value of the global of the given type.
+    #[track_caller]
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
-        crate::fast::stats::picell_note_global_write(type_name::<G>());
+        crate::fast::stats::picell_note_global_write(type_name::<G>(), global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         crate::fast::dependencies::note_global_inserted::<G>(self);
         self.globals_by_type.insert(global_type, Box::new(global));

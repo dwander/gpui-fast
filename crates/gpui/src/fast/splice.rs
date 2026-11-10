@@ -1385,3 +1385,89 @@ pub(crate) fn kept_keys<'a>(
     scratch.clear();
     kept
 }
+
+impl Window {
+    /// [PiCell] 진단(`PICELL_FAST_STATS=3`) — [`Self::splice_layout`] 이 `id` 를 지난 프레임에서 복사하지
+    /// 못한 이유. 그 함수의 판정을 같은 순서로 다시 짚는다 — 원 함수는 손대지 않아 상류 병합 충돌을
+    /// 늘리지 않는다(판정이 바뀌면 여기도 맞출 것).
+    pub(crate) fn picell_why_no_splice(&self, id: &GlobalElementId, cx: &App) -> String {
+        if self.refreshing
+            || cx.has_active_drag()
+            || crate::fast::a11y::stale(&self.a11y)
+            || self.is_inspector_picking(cx)
+            || self.retained_state.dirty_subtrees.contains(id)
+            || self.next_frame.retained.by_id.contains_key(id)
+            || crate::fast::layers::paint::inside_layer(self)
+        {
+            return "refresh/drag/a11y/inspector/self notified/drawn/layer".into();
+        }
+        let Some(entity) = view_entity(id) else {
+            return "not a view".into();
+        };
+        if self.retained_state.notified_entities.contains(&entity) {
+            return "self notified".into();
+        }
+        let Some(previous) = self.rendered_frame.retained.find(id) else {
+            return "no record".into();
+        };
+        let records = &self.rendered_frame.retained.records;
+        let record = &records[previous];
+        let Some(layout) = record.layout.as_ref() else {
+            return "record has no layout".into();
+        };
+        let own_changed = cx.dependencies_changed(&record.own_dependencies, self.inside_notified_view());
+        let own_offset = crate::fast::layers::invalidate::offset_read_changed(self, &record.own_dependencies);
+        let own_hover = !self.hovers_unchanged(&record.own_hovers);
+        if layout.rem_size != self.rem_size()
+            || layout.text_style != self.text_style()
+            || own_changed
+            || own_offset
+            || own_hover
+        {
+            let deps = if own_changed {
+                cx.picell_why_changed(&record.own_dependencies, self.inside_notified_view())
+            } else {
+                String::new()
+            };
+            return format!("own: deps=[{deps}] offset={own_offset} hover={own_hover}");
+        }
+        let mut gaps = Vec::new();
+        let mut index = previous + 1;
+        while index <= previous + record.nested {
+            let nested = &records[index];
+            if view_entity(&nested.id).is_some_and(|entity| self.dirty_views.contains(&entity)) {
+                if nested.rebuild.is_none()
+                    || nested.layout.is_none()
+                    || !matches!(nested.paint, PaintStatus::Painted { .. })
+                {
+                    return "gap: not rebuildable".into();
+                }
+                if !self
+                    .layout_engine
+                    .as_ref()
+                    .unwrap()
+                    .layout_reaches(layout.root, nested.layout.as_ref().unwrap().root)
+                {
+                    return "gap: under a separate layout root".into();
+                }
+                gaps.push(index);
+            }
+            index += nested.nested + 1;
+        }
+        if gaps.is_empty() {
+            return "no gaps".into();
+        }
+        let mut deferred_cursor = record.prepaint_range.start.deferred_draws_index;
+        for &gap in &gaps {
+            let range = &records[gap].prepaint_range;
+            if deferred_cursor != range.start.deferred_draws_index {
+                return "deferred draw outside the gaps".into();
+            }
+            deferred_cursor = range.end.deferred_draws_index;
+        }
+        if deferred_cursor != record.prepaint_range.end.deferred_draws_index {
+            return "deferred draw outside the gaps".into();
+        }
+        "splice_layout_holds failed".into()
+    }
+}

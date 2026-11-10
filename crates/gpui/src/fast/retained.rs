@@ -594,7 +594,11 @@ impl Window {
     /// Where it is drawn is not checked here; see
     /// [`Window::retained_context_matches`].
     pub(crate) fn reusable_retained(&self, id: &GlobalElementId, cx: &App) -> Option<usize> {
-        self.reusable_record(id, cx, false)
+        let found = self.reusable_record(id, cx, false);
+        if found.is_none() {
+            self.picell_why(id, || self.picell_why_not_reusable(id, cx, false)); // [PiCell] 진단
+        }
+        found
     }
 
     /// The record the cached view `id` left last frame, if nothing about
@@ -603,7 +607,11 @@ impl Window {
     /// does not draw a cached view again (see
     /// [`App::notified_dependencies_changed`]).
     pub(crate) fn reusable_cached(&self, id: &GlobalElementId, cx: &App) -> Option<usize> {
-        self.reusable_record(id, cx, true)
+        let found = self.reusable_record(id, cx, true);
+        if found.is_none() {
+            self.picell_why(id, || format!("(cached) {}", self.picell_why_not_reusable(id, cx, true))); // [PiCell] 진단
+        }
+        found
     }
 
     fn reusable_record(&self, id: &GlobalElementId, cx: &App, cached: bool) -> Option<usize> {
@@ -1518,6 +1526,12 @@ impl<V: View> ViewElement<V> {
                         {
                             return (root, ViewLayout::Spliced(splice));
                         }
+                        // [PiCell] 진단 — 알림을 받았거나(그 조상) 지난 프레임 것을 못 써 통째로 빌드한다.
+                        if window.dirty_views.contains(&entity_id) {
+                            window.picell_why(global_id, || {
+                                format!("splice: {}", window.picell_why_no_splice(global_id, cx))
+                            });
+                        }
                         let start = note_rendering(window, cx, entity_id);
                         let mut recording = window.begin_retained_layout(cx);
                         let mut element =
@@ -1634,6 +1648,7 @@ impl<V: View> ViewElement<V> {
                             window.reuse_retained_prepaint(previous, true, cx),
                         );
                     }
+                    window.picell_why(global_id, || "moved".into()); // [PiCell] 진단
                     self.build_at_retained_layout(previous, global_id, bounds, window, cx)
                 }
                 ViewLayout::Kept(layout) => {
@@ -1664,6 +1679,7 @@ impl<V: View> ViewElement<V> {
                     {
                         return window.splice_prepaint(global_id, splice, cx);
                     }
+                    window.picell_why(global_id, || "splice abandoned (moved / nested layout)".into()); // [PiCell] 진단
                     window.abandon_splice(splice);
                     self.build_at_retained_layout(previous, global_id, bounds, window, cx)
                 }
@@ -2003,5 +2019,55 @@ impl HitboxId {
             return false;
         }
         self.hit_test(window)
+    }
+}
+
+impl Window {
+    /// [PiCell] 진단(`PICELL_FAST_STATS=3`) — [`Self::reusable_record`] 이 `id` 를 지난 프레임 그대로 쓰지
+    /// 못한 이유. 원 함수의 판정을 같은 순서로 다시 짚는다(원 함수는 손대지 않는다 — 판정이 바뀌면 맞출 것).
+    fn picell_why_not_reusable(&self, id: &GlobalElementId, cx: &App, cached: bool) -> String {
+        if self.refreshing {
+            return "refreshing".into();
+        }
+        if cx.has_active_drag() {
+            return "drag".into();
+        }
+        if crate::fast::a11y::stale(&self.a11y) || self.is_inspector_picking(cx) {
+            return "a11y/inspector".into();
+        }
+        if self.retained_state.dirty_subtrees.contains(id) {
+            return "dirty subtree".into();
+        }
+        if self.next_frame.retained.by_id.contains_key(id) || crate::fast::layers::paint::inside_layer(self)
+        {
+            return "already drawn / inside layer".into();
+        }
+        let Some(index) = self.rendered_frame.retained.find(id) else {
+            return "no record".into();
+        };
+        let record = &self.rendered_frame.retained.records[index];
+        let changed = if cached {
+            cx.picell_cached_dependencies_changed(&record.dependencies)
+        } else {
+            cx.dependencies_changed(&record.dependencies, self.inside_notified_view())
+        };
+        if changed {
+            return cx.picell_why_changed(&record.dependencies, self.inside_notified_view());
+        }
+        if crate::fast::layers::invalidate::offset_read_changed(self, &record.dependencies) {
+            return "scroll offset read".into();
+        }
+        "hover".into()
+    }
+
+    /// [PiCell] 진단 — 다시 빌드한 이유 한 줄 (`[fast-why]`).
+    fn picell_why(&self, id: &GlobalElementId, reason: impl FnOnce() -> String) {
+        if crate::fast::stats::picell_why_enabled() {
+            let name = match id.ids.last() {
+                Some(ElementId::View(entity)) => crate::fast::stats::picell_entity_name(entity.clone()),
+                other => format!("{other:?}"),
+            };
+            log::info!("[fast-why] {name} <- {}", reason());
+        }
     }
 }

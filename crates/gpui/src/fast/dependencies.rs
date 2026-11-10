@@ -510,6 +510,56 @@ impl App {
     /// view notified since the last frame, which upstream builds again with
     /// everything under it, and which often changes a model it renders and
     /// notifies only itself.
+    /// [PiCell] 진단(`PICELL_FAST_STATS=3`) — `dependencies_changed` 가 참인 이유를 한 줄로.
+    pub(crate) fn picell_why_changed(
+        &self,
+        dependencies: &RenderDependencies,
+        inside_notified: bool,
+    ) -> String {
+        use crate::fast::stats::{picell_entity_name, picell_global_name};
+        let log = &self.entities.access_log;
+        let mut out: Vec<String> = Vec::new();
+        if dependencies.updates != log.update_generation {
+            for entity in dependencies.entities.iter() {
+                let after = |stamps: &FxHashMap<EntityId, u64>| {
+                    stamps.get(entity).is_some_and(|at| *at > dependencies.updates)
+                };
+                if after(&log.changed_at) {
+                    out.push(format!("changed:{}", picell_entity_name(*entity)));
+                } else if inside_notified && after(&log.updated_at) {
+                    out.push(format!("updated:{}", picell_entity_name(*entity)));
+                }
+            }
+        }
+        if log.write_generation.get() != dependencies.writes.to {
+            for entity in dependencies.entities.iter() {
+                if log
+                    .written_at
+                    .get(entity)
+                    .is_some_and(|at| dependencies.writes.is_foreign(*at))
+                {
+                    out.push(format!("written:{}", picell_entity_name(*entity)));
+                }
+            }
+        }
+        for global in dependencies.globals.iter() {
+            if self
+                .dependencies
+                .global_changed_at
+                .get(global)
+                .is_some_and(|at| *at > dependencies.generation)
+            {
+                out.push(format!("global:{}", picell_global_name(*global)));
+            }
+        }
+        if dependencies.states.iter().any(|(version, read_at)| version.get() != *read_at) {
+            out.push("state".into());
+        }
+        out.sort();
+        out.dedup();
+        out.join(",")
+    }
+
     pub(crate) fn dependencies_changed(
         &self,
         dependencies: &RenderDependencies,

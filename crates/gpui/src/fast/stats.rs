@@ -346,10 +346,45 @@ pub(crate) fn picell_note_draw_kind(kind: &'static str) {
 }
 
 /// [PiCell] 트라이얼 진단 — 바뀐(것으로 치는) 글로벌.
-pub(crate) fn picell_note_global_write(type_name: &'static str) {
+#[track_caller]
+pub(crate) fn picell_note_global_write(type_name: &'static str, type_id: std::any::TypeId) {
     if picell_level() >= 2 {
-        log::info!("[fast-global] {}", type_name.rsplit("::").next().unwrap_or(type_name));
+        let short = type_name.rsplit("::").next().unwrap_or(type_name);
+        PICELL_GLOBAL_NAMES.with_borrow_mut(|names| names.insert(type_id, short));
+        if short != "GroupHitboxes" {
+            log::info!("[fast-global] {} at {}", short, std::panic::Location::caller());
+        }
     }
+}
+
+/// [PiCell] 진단 — 글로벌 TypeId → 이름 (쓰기를 본 글로벌만 안다).
+pub(crate) fn picell_global_name(type_id: std::any::TypeId) -> String {
+    PICELL_GLOBAL_NAMES
+        .with_borrow(|names| names.get(&type_id).map(|n| n.to_string()))
+        .unwrap_or_else(|| format!("{type_id:?}"))
+}
+
+/// [PiCell] 진단 — 엔티티 id → 뷰 타입 이름 (render 된 적 없는 엔티티는 id).
+pub(crate) fn picell_entity_name(entity_id: crate::EntityId) -> String {
+    let name = PICELL_NAMES.with_borrow(|names| names.get(&entity_id).copied());
+    name.map_or_else(|| format!("{entity_id:?}"), |n| n.rsplit("::").next().unwrap_or(n).to_string())
+}
+
+/// [PiCell] 진단 — 뷰 render 시간 재기 시작 (수준 3 일 때만 시계를 읽는다).
+pub(crate) fn picell_render_started() -> Option<std::time::Instant> {
+    (picell_level() >= 3).then(std::time::Instant::now)
+}
+
+/// [PiCell] 진단 — 뷰 render(요소 트리 만들기, 안쪽 뷰 제외) 시간을 타입별로 쌓는다(수준 3).
+pub(crate) fn picell_note_render_time(type_name: &'static str, started: Option<std::time::Instant>) {
+    if let Some(started) = started {
+        let spent = started.elapsed();
+        PICELL_RENDER_TIME.with_borrow_mut(|times| *times.entry(type_name).or_default() += spent);
+    }
+}
+
+pub(crate) fn picell_why_enabled() -> bool {
+    picell_level() >= 3
 }
 
 /// [PiCell] 트라이얼 진단 — notify 된 엔티티(뷰면 타입 이름).
@@ -366,6 +401,10 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
     static PICELL_DRAW_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("frame") };
     static PICELL_FRAME_RENDERS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PICELL_RENDER_TIME: std::cell::RefCell<std::collections::HashMap<&'static str, Duration>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PICELL_GLOBAL_NAMES: std::cell::RefCell<std::collections::HashMap<std::any::TypeId, &'static str>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub(crate) fn picell_log(window: &mut Window) {
@@ -428,4 +467,18 @@ pub(crate) fn picell_log(window: &mut Window) {
         })
         .collect();
     log::info!("[fast-stats] renders: {}", top.join(" "));
+    if picell_level() >= 3 {
+        let mut times: Vec<(&'static str, Duration)> =
+            PICELL_RENDER_TIME.with_borrow_mut(|times| times.drain().collect());
+        times.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = times
+            .iter()
+            .take(8)
+            .map(|(name, spent)| {
+                let short = name.rsplit("::").next().unwrap_or(name);
+                format!("{short}={:.2}ms", spent.as_secs_f64() * 1000.0)
+            })
+            .collect();
+        log::info!("[fast-stats] render time (total): {}", top.join(" "));
+    }
 }

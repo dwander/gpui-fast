@@ -186,7 +186,10 @@ mod any_view {
             .insert(view.entity_id(), std::any::type_name::<V>());
         crate::fast::dependencies::render_next(&mut cx.entities, view.entity_id());
         crate::fast::stats::picell_note_render(std::any::type_name::<V>(), view.entity_id());
-        view.update(cx, |view, cx| view.render(window, cx).into_any_element())
+        let started = crate::fast::stats::picell_render_started();
+        let element = view.update(cx, |view, cx| view.render(window, cx).into_any_element());
+        crate::fast::stats::picell_note_render_time(std::any::type_name::<V>(), started);
+        element
     }
 }
 
@@ -238,9 +241,12 @@ impl<T: Render> View for Entity<T> {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         crate::fast::dependencies::render_next(&mut cx.entities, self.entity_id());
         crate::fast::stats::picell_note_render(std::any::type_name::<T>(), self.entity_id());
-        self.update(cx, |this, cx| {
+        let started = crate::fast::stats::picell_render_started();
+        let element = self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
-        })
+        });
+        crate::fast::stats::picell_note_render_time(std::any::type_name::<T>(), started);
+        element
     }
 }
 
