@@ -620,7 +620,7 @@ impl Window {
         let index = self.rendered_frame.retained.find(id)?;
         let record = &self.rendered_frame.retained.records[index];
         let changed = if cached {
-            cx.notified_dependencies_changed(&record.dependencies)
+            cx.picell_cached_dependencies_changed(&record.dependencies)
         } else {
             cx.dependencies_changed(&record.dependencies, self.inside_notified_view())
         };
@@ -1154,7 +1154,8 @@ impl Window {
                 // A cached view is drawn again for what is notified, not
                 // for what is only updated. See
                 // `App::notified_dependencies_changed`.
-                if cx.notified_dependencies_changed(&record.own_dependencies) || changed_alone() {
+                if cx.picell_cached_dependencies_changed(&record.own_dependencies) || changed_alone()
+                {
                     changed.push(entity);
                 }
                 cached.push(index + record.nested);

@@ -308,9 +308,18 @@ impl Window {
 /// [PiCell] 트라이얼 진단 — `PICELL_FAST_STATS=1` 이면 1초마다 그 사이 그린 프레임의 작업량
 /// (뷰 재빌드·재사용, 스크롤 레이어, 단계별 시간)을 `log::info!` 로 남기고 카운터를 비운다.
 /// 테스트 빌드 밖에서는 `Window::layout_stats` 가 없어 앱에서 Retained Mode 효과를 볼 길이 없다.
+fn picell_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("PICELL_FAST_STATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn picell_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PICELL_FAST_STATS").is_ok_and(|v| v == "1"))
+    picell_level() > 0
 }
 
 thread_local! {
@@ -319,10 +328,44 @@ thread_local! {
 }
 
 /// [PiCell] 트라이얼 진단 — 뷰 render 가 실제로 불린 횟수를 타입 이름별로 센다.
-pub(crate) fn picell_note_render(type_name: &'static str) {
+pub(crate) fn picell_note_render(type_name: &'static str, entity_id: crate::EntityId) {
     if picell_enabled() {
+        PICELL_NAMES.with_borrow_mut(|names| names.insert(entity_id, type_name));
         PICELL_RENDERS.with_borrow_mut(|renders| *renders.entry(type_name).or_default() += 1);
+        if picell_level() >= 2 {
+            PICELL_FRAME_RENDERS.with_borrow_mut(|frame| frame.push(type_name));
+        }
     }
+}
+
+/// [PiCell] 트라이얼 진단 — 다음 draw 가 어디서 불렸는지(프레임 로그에 붙인다).
+pub(crate) fn picell_note_draw_kind(kind: &'static str) {
+    if picell_level() >= 2 {
+        PICELL_DRAW_KIND.set(kind);
+    }
+}
+
+/// [PiCell] 트라이얼 진단 — 바뀐(것으로 치는) 글로벌.
+pub(crate) fn picell_note_global_write(type_name: &'static str) {
+    if picell_level() >= 2 {
+        log::info!("[fast-global] {}", type_name.rsplit("::").next().unwrap_or(type_name));
+    }
+}
+
+/// [PiCell] 트라이얼 진단 — notify 된 엔티티(뷰면 타입 이름).
+pub(crate) fn picell_note_notify(entity_id: crate::EntityId) {
+    if picell_level() >= 2 {
+        let name = PICELL_NAMES.with_borrow(|names| names.get(&entity_id).copied());
+        let name = name.map_or_else(|| format!("{entity_id:?}"), |n| n.rsplit("::").next().unwrap_or(n).to_string());
+        log::info!("[fast-notify] {name}");
+    }
+}
+
+thread_local! {
+    static PICELL_NAMES: std::cell::RefCell<std::collections::HashMap<crate::EntityId, &'static str>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PICELL_DRAW_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("frame") };
+    static PICELL_FRAME_RENDERS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn picell_log(window: &mut Window) {
@@ -335,6 +378,16 @@ pub(crate) fn picell_log(window: &mut Window) {
         static FRAMES: Cell<u64> = const { Cell::new(0) };
     }
     FRAMES.set(FRAMES.get() + 1);
+    if picell_level() >= 2 {
+        // 프레임마다: 이 프레임에 render 된 뷰.
+        let rendered: Vec<String> = PICELL_FRAME_RENDERS.with_borrow_mut(|frame| {
+            let out = frame.iter().map(|name| name.rsplit("::").next().unwrap_or(name).to_string()).collect();
+            frame.clear();
+            out
+        });
+        let kind = PICELL_DRAW_KIND.replace("frame");
+        log::info!("[fast-frame {kind}] {}", rendered.join(" "));
+    }
     let now = std::time::Instant::now();
     let start = WINDOW_START.get().unwrap_or(now);
     WINDOW_START.set(Some(start));

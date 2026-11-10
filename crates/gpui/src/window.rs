@@ -6636,6 +6636,7 @@ impl Window {
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
+            crate::fast::stats::picell_note_draw_kind("key-dispatch");
             self.draw(cx).clear(cx);
         }
 

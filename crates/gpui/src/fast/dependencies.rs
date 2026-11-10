@@ -549,6 +549,25 @@ impl App {
             || self.globals_or_states_changed(dependencies)
     }
 
+    /// [PiCell] Whether a cached view ([`crate::Entity::cached`]) has to be built again for
+    /// what it read: only for versioned state — a scroll handle or list state it reads moved.
+    ///
+    /// Upstream builds a cached view again only when it, or a view drawn in it, is notified
+    /// (which `dirty_views` already covers), or it moved; an entity or global it read changing
+    /// does not. gpui-fast's [`Self::notified_dependencies_changed`] also builds it for every
+    /// entity it read that was notified — PiCell's thumbnail grid reads the whole panel, which
+    /// is notified on every selection move, and decides itself when the grid must draw again
+    /// (`skip_grid_notify_once`), so that rebuilt all of its cells on every step.
+    pub(crate) fn picell_cached_dependencies_changed(
+        &self,
+        dependencies: &RenderDependencies,
+    ) -> bool {
+        dependencies
+            .states
+            .iter()
+            .any(|(version, read_at)| version.get() != *read_at)
+    }
+
     fn globals_or_states_changed(&self, dependencies: &RenderDependencies) -> bool {
         dependencies.globals.iter().any(|global| {
             self.dependencies
@@ -760,6 +779,7 @@ pub(crate) fn note_access(entities: &EntityMap, entity_id: EntityId) {
 /// changes nothing a view could have read.
 #[inline(always)]
 pub(crate) fn note_notify(entities: &mut EntityMap, entity_id: EntityId) {
+    crate::fast::stats::picell_note_notify(entity_id);
     crate::fast::layers::invalidate::note_notify(entity_id);
     let log = &mut entities.access_log;
     if log.updated_unnotified.remove(&entity_id)
@@ -833,6 +853,26 @@ pub(crate) fn query<T: 'static, R>(
     let result = entity.update(cx, query);
     cx.entities.access_log.queried = outer;
     result
+}
+
+impl<T: 'static> Entity<T> {
+    /// [PiCell] Updates the entity the way GPUI asks a text input about its state every frame:
+    /// what the closure does is not counted as changing what the entity holds, unless it
+    /// notifies — views that read the entity are not built again for it.
+    ///
+    /// For callbacks a view's element calls while the window draws that need the view's
+    /// `&mut` context but change nothing anyone else shows — a virtual list's item renderer
+    /// building rows from its owner's state. An `update` there counts as a write made while
+    /// drawing, so every view reading the owner is built again on the next frame, which builds
+    /// the list again, which writes again (PiCell's thumbnail grid redrew the whole window
+    /// twice per arrow-key step that scrolled it).
+    pub fn update_as_query<R>(
+        &self,
+        cx: &mut App,
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> R {
+        query(self, cx, update)
+    }
 }
 
 /// Where a recording started by [`App::begin_recording_dependencies`] begins.
