@@ -50,6 +50,10 @@ pub struct WindowsWindowState {
     pub logical_size: Cell<Size<Pixels>>,
     pub min_size: Option<Size<Pixels>>,
     pub fullscreen_restore_bounds: Cell<Bounds<Pixels>>,
+    /// The placement read while handling `WM_DESTROY`. From then on the
+    /// handle no longer names this window (it may even name another one), so
+    /// `window_bounds` reports this instead of asking the OS.
+    final_placement: Cell<Option<(Bounds<Pixels>, bool)>>,
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
@@ -185,6 +189,7 @@ impl WindowsWindowState {
             origin: Cell::new(origin),
             logical_size: Cell::new(logical_size),
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
+            final_placement: Cell::new(None),
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
@@ -240,6 +245,12 @@ impl WindowsWindowState {
 
     // Calculate the bounds used for saving and whether the window is maximized.
     fn calculate_window_bounds(&self) -> (Bounds<Pixels>, bool) {
+        // A destroyed window keeps reporting where it was. Asking the OS would
+        // fail and turn the zeroed placement into a negative size (an app
+        // saving it reopens at its minimum size).
+        if let Some(placement) = self.final_placement.get() {
+            return placement;
+        }
         let placement = unsafe {
             let mut placement = WINDOWPLACEMENT {
                 length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
@@ -270,6 +281,14 @@ impl WindowsWindowState {
         } else {
             WindowBounds::Windowed(bounds)
         }
+    }
+
+    /// Records the placement for good. Call while handling `WM_DESTROY`, the
+    /// last moment the handle still names this window: GPUI keeps the window
+    /// until its deferred close runs, and anything reading `window_bounds` in
+    /// between (an app saving its placement) must see where it was.
+    pub(crate) fn freeze_placement(&self) {
+        self.final_placement.set(Some(self.calculate_window_bounds()));
     }
 
     /// get the logical size of the app's drawable area.
