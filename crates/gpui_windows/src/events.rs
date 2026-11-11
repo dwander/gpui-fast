@@ -323,6 +323,12 @@ impl WindowsWindowInner {
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
         self.destroyed.set(true);
+        // Destroying the active window deactivates it first, and `WM_ACTIVATE`
+        // defers that report to a task that would run after the window is gone:
+        // observers would read the dead handle (`GetWindowPlacement` fails and
+        // the bounds come back as an empty rect). `Drop` does the same for the
+        // app-driven path.
+        self.state.callbacks.active_status_change.take();
         // Revoke while the handle is still valid. The drop target holds an `Rc`
         // to this window, so a revoke deferred past destruction fails and leaks
         // the whole window state, renderer included.
