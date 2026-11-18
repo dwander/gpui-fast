@@ -602,16 +602,17 @@ impl WindowsWindow {
             draw_coordinator,
             parent_hwnd,
         };
+        let fast_rect = crate::fast::initial_placement::create_rect(display, params.bounds);
         let creation_result = unsafe {
             CreateWindowExW(
                 dwexstyle,
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                fast_rect.0,
+                fast_rect.1,
+                fast_rect.2,
+                fast_rect.3,
                 owner_hwnd,
                 None,
                 Some(hinstance.into()),
@@ -1021,12 +1022,14 @@ impl PlatformWindow for WindowsWindow {
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
+                crate::fast::backdrop::clear(hwnd);
             }
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
+                crate::fast::backdrop::clear(hwnd);
             }
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                crate::fast::backdrop::blur(hwnd);
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
@@ -1849,7 +1852,7 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     }
 }
 
-fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
+pub(crate) fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
 
