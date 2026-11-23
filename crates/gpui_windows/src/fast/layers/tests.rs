@@ -905,7 +905,9 @@ impl Harness {
     }
 }
 
-fn create_device(driver_type: D3D_DRIVER_TYPE) -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_device(
+    driver_type: D3D_DRIVER_TYPE,
+) -> Option<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None;
     let mut context = None;
     unsafe {
@@ -930,7 +932,10 @@ fn create_device(driver_type: D3D_DRIVER_TYPE) -> Option<(ID3D11Device, ID3D11De
 }
 
 /// The rasterizer state `DirectXResources::new` sets.
-fn set_rasterizer_state(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<()> {
+pub(crate) fn set_rasterizer_state(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+) -> Result<()> {
     let desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,

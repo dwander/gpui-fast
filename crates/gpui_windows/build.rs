@@ -63,6 +63,18 @@ mod shader_compilation {
                 &rust_binding_path,
             );
         }
+        // [PiCell] Fragment only: `picell_clip_probe` swaps it into the polychrome pipeline, whose
+        // vertex shader stays.
+        let unclipped_polychrome = crate::fast_rounded_clip_shader::UNCLIPPED_POLYCHROME_ENTRY
+            .strip_suffix("_fragment")
+            .expect("fragment entry point");
+        compile_fragment_for_module(
+            unclipped_polychrome,
+            &out_dir,
+            &fxc_path,
+            shader_path.to_str().unwrap(),
+            &rust_binding_path,
+        );
     }
 
     /// Locate `binary` in the newest installed Windows SDK.
@@ -155,7 +167,16 @@ mod shader_compilation {
         );
         generate_rust_binding(&const_name, &output_file, rust_binding_path);
 
-        // Compile fragment shader
+        compile_fragment_for_module(module, out_dir, fxc_path, shader_path, rust_binding_path);
+    }
+
+    fn compile_fragment_for_module(
+        module: &str,
+        out_dir: &str,
+        fxc_path: &str,
+        shader_path: &str,
+        rust_binding_path: &str,
+    ) {
         let output_file = format!("{}/{}_ps.h", out_dir, module);
         let const_name = format!("{}_FRAGMENT_BYTES", module.to_uppercase());
         compile_shader_impl(

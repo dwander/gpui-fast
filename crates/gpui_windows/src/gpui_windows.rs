@@ -13,6 +13,7 @@ mod display;
 mod events;
 mod fast;
 mod hdr_display;
+mod picell_clip_probe;
 mod picell_filters;
 mod keyboard;
 mod platform;

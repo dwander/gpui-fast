@@ -321,7 +321,7 @@ impl DirectXRenderer {
             Some(composition)
         };
 
-        Ok(DirectXRenderer {
+        let mut renderer = DirectXRenderer {
             hwnd,
             atlas,
             devices: Some(devices),
@@ -338,7 +338,10 @@ impl DirectXRenderer {
             fast_recovery: crate::fast::device_recovery::RecoveryState::default(),
             active_render_target: None,
             hdr: HdrOutput::default(),
-        })
+        };
+        // [PiCell]
+        crate::picell_clip_probe::apply(&mut renderer);
+        Ok(renderer)
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -478,6 +481,8 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        // [PiCell]
+        crate::picell_clip_probe::apply(self);
         self.direct_composition = direct_composition;
         crate::fast::composition::recreate(self)?;
         self.skip_draws = true;
@@ -2057,7 +2062,10 @@ fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11Ver
 }
 
 #[inline]
-fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11PixelShader> {
+pub(crate) fn create_fragment_shader(
+    device: &ID3D11Device,
+    bytes: &[u8],
+) -> Result<ID3D11PixelShader> {
     unsafe {
         let mut shader = None;
         device.CreatePixelShader(bytes, None, Some(&mut shader))?;
@@ -2177,11 +2185,11 @@ fn set_swap_chain_color_space(
 }
 
 /// A CPU copy of a texture's first mip, rows packed tight.
-struct TextureReadback {
-    width: u32,
+pub(crate) struct TextureReadback {
+    pub(crate) width: u32,
     height: u32,
     format: DXGI_FORMAT,
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl TextureReadback {
@@ -2200,7 +2208,7 @@ impl TextureReadback {
 }
 
 /// Copy `texture` through a `D3D11_USAGE_STAGING` texture into CPU memory.
-fn read_back_texture(
+pub(crate) fn read_back_texture(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
@@ -2336,6 +2344,8 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        /// [PiCell] Fragment only — `picell_clip_probe` swaps it into the polychrome pipeline.
+        PolychromeSpriteUnclipped,
         BlurDownsample,
         Blur,
         BlurComposite,
@@ -2412,6 +2422,11 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::PolychromeSpriteUnclipped => match target {
+                    // Fails like the debug build, which has no such vertex entry point.
+                    ShaderTarget::Vertex => unreachable!("fragment-only shader module"),
+                    ShaderTarget::Fragment => POLYCHROME_SPRITE_UNCLIPPED_FRAGMENT_BYTES,
                 },
                 ShaderModule::BlurDownsample => match target {
                     ShaderTarget::Vertex => BLUR_DOWNSAMPLE_VERTEX_BYTES,
@@ -2510,6 +2525,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                // `rounded_clip_shader_build::UNCLIPPED_POLYCHROME_ENTRY` without `_fragment`.
+                ShaderModule::PolychromeSpriteUnclipped => "polychrome_sprite_unclipped",
                 ShaderModule::BlurDownsample => "blur_downsample",
                 ShaderModule::Blur => "blur",
                 ShaderModule::BlurComposite => "blur_composite",

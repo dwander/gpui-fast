@@ -147,6 +147,31 @@ impl Masks {
     }
 }
 
+/// [PiCell] The clip geometry of `count` rounded rectangles of `radius`, nested one pixel apart
+/// inside `size` × `size`, as [`draw_group`] binds nested clips: what `picell_clip_probe` draws a
+/// sprite through.
+pub(crate) fn probe_view(
+    device: &ID3D11Device,
+    size: f32,
+    radius: f32,
+    count: usize,
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    let masks = Masks {
+        clips: (0..count)
+            .map(|depth| {
+                let inset = depth as f32;
+                Clip {
+                    bounds: [inset, inset, size - inset, size - inset],
+                    horizontal: [radius; 4],
+                    vertical: [radius; 4],
+                }
+            })
+            .collect(),
+        ..Default::default()
+    };
+    masks.clip_view(device)
+}
+
 pub(crate) fn begin_frame(masks: &mut Masks) {
     masks.clips.clear();
     masks.paths.retain(|slot| slot.used);

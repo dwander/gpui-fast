@@ -23,34 +23,30 @@ pub fn stage() {
     std::fs::write(generated_path(std::env::var("OUT_DIR").unwrap()), source).unwrap();
 }
 
+/// [PiCell] `polychrome_sprite_fragment` as upstream wrote it, without the rounded clip, compiled
+/// under this entry point name: `picell_clip_probe` swaps it into the polychrome pipeline on
+/// drivers that draw nothing through the clipped one.
+pub const UNCLIPPED_POLYCHROME_ENTRY: &str = "polychrome_sprite_unclipped_fragment";
+const POLYCHROME_ENTRY: &str = "polychrome_sprite_fragment";
+
 pub fn source(original: &str, alpha: &str) -> String {
     let mut source = original.replace("#include \"alpha_correction.hlsl\"", alpha);
+    // Copied before the loop below wraps its returns.
+    let unclipped_polychrome = {
+        let (start, _, body_end) = function_span(&source, POLYCHROME_ENTRY);
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        source[line_start..=body_end].replacen(POLYCHROME_ENTRY, UNCLIPPED_POLYCHROME_ENTRY, 1)
+    };
     for name in [
         "quad_fragment",
         "shadow_fragment",
         "underline_fragment",
         "monochrome_sprite_fragment",
-        "polychrome_sprite_fragment",
+        POLYCHROME_ENTRY,
         "path_sprite_fragment",
         "subpixel_sprite_fragment",
     ] {
-        let start = source
-            .find(&format!("{name}("))
-            .expect("upstream HLSL fragment entry point");
-        let body_start = start + source[start..].find('{').unwrap();
-        let mut depth = 1;
-        let mut body_end = body_start + 1;
-        for (offset, ch) in source[body_start + 1..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                body_end = body_start + 1 + offset;
-                break;
-            }
-        }
+        let (_, body_start, body_end) = function_span(&source, name);
         let body = &source[body_start + 1..body_end];
         let body = if name == "subpixel_sprite_fragment" {
             assert!(body.contains("return output;"));
@@ -76,6 +72,8 @@ pub fn source(original: &str, alpha: &str) -> String {
         };
         source.replace_range(body_start + 1..body_end, &body);
     }
+    source.push('\n');
+    source.push_str(&unclipped_polychrome);
     format!(
         r#"
 struct FastRoundedClip {{
@@ -128,4 +126,27 @@ float4 fast_clip_color(float4 color, float2 position, bool premultiplied) {{
 {source}
 "#
     )
+}
+
+/// Where the definition of the function `name` starts (at its name) and where its body opens and
+/// closes (the braces' byte offsets).
+fn function_span(source: &str, name: &str) -> (usize, usize, usize) {
+    let start = source
+        .find(&format!("{name}("))
+        .expect("upstream HLSL fragment entry point");
+    let body_start = start + source[start..].find('{').unwrap();
+    let mut depth = 1;
+    let mut body_end = body_start + 1;
+    for (offset, ch) in source[body_start + 1..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            body_end = body_start + 1 + offset;
+            break;
+        }
+    }
+    (start, body_start, body_end)
 }
