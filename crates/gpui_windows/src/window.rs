@@ -54,6 +54,8 @@ pub struct WindowsWindowState {
     /// handle no longer names this window (it may even name another one), so
     /// `window_bounds` reports this instead of asking the OS.
     final_placement: Cell<Option<(Bounds<Pixels>, bool)>>,
+    /// [PiCell] A `set_bounds_with_frame` move waiting for its frame (`picell_synced_bounds`).
+    pub(crate) pending_bounds: Cell<Option<crate::picell_synced_bounds::PendingBounds>>,
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
@@ -190,6 +192,7 @@ impl WindowsWindowState {
             logical_size: Cell::new(logical_size),
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             final_placement: Cell::new(None),
+            pending_bounds: Cell::new(None),
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
@@ -745,6 +748,8 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
         let hwnd = self.0.hwnd;
+        // A plain move overrides a synced one still waiting for its frame.
+        self.state.pending_bounds.set(None);
         let bounds = bounds.to_device_pixels(self.scale_factor());
         // The border offset lives outside the logical bounds, so position and size both come
         // from the adjusted rect -- passing `bounds.origin` here would shift the window by
@@ -769,6 +774,16 @@ impl PlatformWindow for WindowsWindow {
                 }
             })
             .detach();
+    }
+
+    fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) {
+        let rect = calculate_window_rect(
+            bounds.to_device_pixels(self.scale_factor()),
+            &self.state.border_offset,
+        );
+        if !crate::picell_synced_bounds::request(&self.0, self.0.hwnd, bounds, rect) {
+            self.set_bounds(bounds);
+        }
     }
 
     fn scale_factor(&self) -> f32 {

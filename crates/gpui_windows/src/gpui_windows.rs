@@ -15,6 +15,7 @@ mod fast;
 mod hdr_display;
 mod picell_clip_probe;
 mod picell_filters;
+mod picell_synced_bounds;
 mod keyboard;
 mod platform;
 mod system_notifications;

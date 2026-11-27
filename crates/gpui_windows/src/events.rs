@@ -239,6 +239,7 @@ impl WindowsWindowInner {
         let width = lparam.loword().max(1) as i32;
         let height = lparam.hiword().max(1) as i32;
         let new_size = size(DevicePixels(width), DevicePixels(height));
+        crate::picell_synced_bounds::on_size(self, new_size);
 
         let scale_factor = self.state.scale_factor.get();
         let mut should_resize_renderer = false;
@@ -255,7 +256,7 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_change(
+    pub(crate) fn handle_size_change(
         &self,
         device_size: Size<DevicePixels>,
         scale_factor: f32,
@@ -1532,6 +1533,7 @@ impl WindowsWindowInner {
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));
+        crate::picell_synced_bounds::apply_after_present(self, handle);
         self.update_ime_enabled(handle);
         // [PiCell] 셸 텍스트 입력 UI(Win+V·Win+.·IME 후보창)에 캐럿 위치를 매 프레임 보고한다.
         // ValidateRect 는 gpui-fast 가 그리기 시작에서 한다(fast::frame_schedule::validate_current_paint).

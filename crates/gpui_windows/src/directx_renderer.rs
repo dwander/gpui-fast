@@ -127,7 +127,7 @@ pub(crate) struct DirectXRendererDevices {
 
 pub(crate) struct DirectXResources {
     // Direct3D rendering objects
-    swap_chain: IDXGISwapChain1,
+    pub(crate) swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     pub(crate) render_target_view: Option<ID3D11RenderTargetView>,
 

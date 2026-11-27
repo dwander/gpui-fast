@@ -3261,6 +3261,13 @@ impl Window {
         self.platform_window.set_bounds(bounds);
     }
 
+    /// [`Window::set_bounds`] that moves the window together with the first frame drawn at
+    /// the new size, instead of before it — for a window sized by its content, where the
+    /// gap between the two shows as a flash. See [`PlatformWindow::set_bounds_with_frame`].
+    pub fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) {
+        self.platform_window.set_bounds_with_frame(bounds);
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()

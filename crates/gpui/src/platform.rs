@@ -1327,6 +1327,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.resize(bounds.size);
     }
+    /// [`PlatformWindow::set_bounds`] for a window whose size follows its content: the
+    /// window keeps its place until GPUI has presented a frame at the new size, then moves,
+    /// so the window and its content change on the same compositor frame.
+    ///
+    /// A plain `set_bounds` resizes the window first and draws the matching frame after:
+    /// until it is presented, the compositor shows the last frame at the old size inside
+    /// the new rectangle (on Windows' DirectComposition the uncovered part is transparent,
+    /// what is behind the window shows through). Backends without that gap keep
+    /// `set_bounds`.
+    fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) {
+        self.set_bounds(bounds);
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
