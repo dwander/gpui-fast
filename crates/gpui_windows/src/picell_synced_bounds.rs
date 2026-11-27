@@ -9,29 +9,41 @@
 //! debug build, every DWM frame captured with Desktop Duplication), and a shrinking one showed the
 //! old frame cut off.
 //!
-//! Here the order is turned around. The swap chain and GPUI take the new size while the window
-//! stays where it is: DWM keeps showing the last presented frame (`ResizeBuffers` does not clear
-//! it). The window moves right after the first frame at that size is presented, so DWM takes the
-//! frame and the new rectangle together.
+//! Here the order is turned around. GPUI asks from its frame callback (`fast::synced_bounds`):
+//! the swap chain takes the new size at once while the window stays where it is (DWM keeps
+//! showing the last presented frame, `ResizeBuffers` does not clear it), GPUI draws its next frame
+//! at that size, and the window moves right after that frame is presented, in the same callback.
+//! DWM takes the frame and the new rectangle together only when both land before the same
+//! composition, and in a release build they did not always: a frame the GPU had not finished yet
+//! came one composition after the new rectangle (1 move in 7), and a composition falling between
+//! a finished frame and the move showed the new frame in the old rectangle (3 in 24). So that
+//! frame is presented once the GPU has finished it and a composition has just passed, which
+//! leaves the move a whole refresh period (0 in 24).
 //!
 //! Nothing here applies to a window that is minimized, hidden, maximized or fullscreen, without
-//! DirectComposition, or whose client size is not changing (a pure move has no gap): those take
-//! `set_bounds`. A size change that arrives meanwhile from anywhere else (the user, a maximize)
-//! drops the pending move.
-
-use std::rc::Rc;
+//! DirectComposition, or whose size is not changing (a pure move has no gap): those take
+//! `set_bounds`. A plain `set_bounds`, or a size change from anywhere else (the user, a
+//! maximize), drops a move still waiting.
 
 use gpui::{Bounds, DevicePixels, Pixels, Size};
 use gpui_util::ResultExt as _;
-use windows::Win32::{
-    Foundation::{HWND, RECT},
-    UI::WindowsAndMessaging::{
-        GetClientRect, IsIconic, IsWindowVisible, IsZoomed, SWP_NOACTIVATE, SWP_NOZORDER,
-        SetWindowPos,
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HWND, RECT},
+        Graphics::{Dwm::DwmFlush, Dxgi::IDXGIDevice2},
+        System::Threading::{CreateEventW, WaitForSingleObject},
+        UI::WindowsAndMessaging::{
+            GetClientRect, IsIconic, IsWindowVisible, IsZoomed, SWP_NOACTIVATE, SWP_NOZORDER,
+            SetWindowPos,
+        },
     },
+    core::{Interface as _, PCWSTR},
 };
 
 use crate::{WindowsWindowInner, directx_renderer::DirectXRenderer};
+
+/// How long the moving frame waits for the GPU at most, in milliseconds.
+const GPU_WAIT_LIMIT_MS: u32 = 50;
 
 /// A move waiting for its frame.
 #[derive(Clone, Copy)]
@@ -40,13 +52,16 @@ pub(crate) struct PendingBounds {
     rect: RECT,
     /// The client size the swap chain and GPUI were given.
     size: Size<DevicePixels>,
-    /// The swap chain's present count right after it took the new size.
-    present_count: Option<u32>,
 }
 
-/// Starts a synced move: `false` when this window takes a plain `set_bounds` instead.
+/// Whether the renderer's next present is the frame the window moves with.
+#[derive(Default)]
+pub(crate) struct SyncedPresent(bool);
+
+/// Gives the swap chain the new size and keeps the move for after the next present: `false`
+/// when this window takes a plain `set_bounds` instead.
 pub(crate) fn request(
-    window: &Rc<WindowsWindowInner>,
+    window: &WindowsWindowInner,
     hwnd: HWND,
     bounds: Bounds<Pixels>,
     rect: RECT,
@@ -61,42 +76,39 @@ pub(crate) fn request(
         .renderer
         .try_borrow()
         .is_ok_and(|renderer| renderer.direct_composition.is_some());
-    if unusual || !composited || client_size(hwnd) == Some(size) {
+    // GPUI's size too: one left behind by a dropped move is put back here.
+    let same_size = client_size(hwnd) == Some(size)
+        && window.state.logical_size.get() == size.to_pixels(scale);
+    if unusual || !composited || same_size {
         return false;
     }
-    // Not from inside the caller: it is usually drawing (a window sized by its content decides
-    // its size while rendering), and GPUI cannot take a resize while the app is borrowed.
-    let inner = window.clone();
+    window.state.logical_size.set(size.to_pixels(scale));
+    crate::fast::device_recovery::resize(window, size);
+    window.state.renderer.borrow_mut().picell_synced_present = SyncedPresent(true);
     window
-        .executor
-        .spawn(async move {
-            inner.handle_size_change(size, scale, true);
-            let present_count = present_count(&inner.state.renderer.borrow());
-            inner.state.pending_bounds.set(Some(PendingBounds {
-                rect,
-                size,
-                present_count,
-            }));
-        })
-        .detach();
+        .state
+        .pending_bounds
+        .set(Some(PendingBounds { rect, size }));
     true
 }
 
-/// After a frame was drawn: moves the window if a frame at the pending size has been presented.
+/// Forwarded to by `DirectXRenderer::present`: the frame the window moves with is presented once
+/// the GPU has finished it and a composition has just passed.
+pub(crate) fn before_present(renderer: &mut DirectXRenderer) {
+    if !std::mem::take(&mut renderer.picell_synced_present.0) {
+        return;
+    }
+    wait_for_gpu(renderer);
+    unsafe { DwmFlush() }.log_err();
+}
+
+/// Forwarded to by `draw_window` after the frame callback, which took the request and presented
+/// the frame at the new size.
 pub(crate) fn apply_after_present(window: &WindowsWindowInner, hwnd: HWND) {
     let Some(pending) = window.state.pending_bounds.get() else {
         return;
     };
-    let presented = window
-        .state
-        .renderer
-        .try_borrow()
-        .ok()
-        .and_then(|renderer| present_count(&renderer));
-    if presented.is_some() && presented == pending.present_count {
-        return;
-    }
-    window.state.pending_bounds.set(None);
+    cancel(window);
     let unusual = unsafe { IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() }
         || window.state.is_fullscreen();
     if unusual {
@@ -130,8 +142,35 @@ pub(crate) fn on_size(window: &WindowsWindowInner, size: Size<DevicePixels>) {
         .get()
         .is_some_and(|pending| pending.size != size)
     {
-        window.state.pending_bounds.set(None);
+        cancel(window);
     }
+}
+
+/// Drops a waiting move, and the wait its frame would have had.
+pub(crate) fn cancel(window: &WindowsWindowInner) {
+    window.state.pending_bounds.set(None);
+    if let Ok(mut renderer) = window.state.renderer.try_borrow_mut() {
+        renderer.picell_synced_present = SyncedPresent(false);
+    }
+}
+
+/// Waits until the GPU has finished the work submitted so far: DWM composes a frame only once
+/// it is finished.
+fn wait_for_gpu(renderer: &DirectXRenderer) {
+    let Some(device) = renderer
+        .devices
+        .as_ref()
+        .and_then(|devices| devices.device.cast::<IDXGIDevice2>().log_err())
+    else {
+        return;
+    };
+    let Some(event) = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.log_err() else {
+        return;
+    };
+    if unsafe { device.EnqueueSetEvent(event) }.log_err().is_some() {
+        unsafe { WaitForSingleObject(event, GPU_WAIT_LIMIT_MS) };
+    }
+    unsafe { CloseHandle(event) }.log_err();
 }
 
 fn client_size(hwnd: HWND) -> Option<Size<DevicePixels>> {
@@ -141,9 +180,4 @@ fn client_size(hwnd: HWND) -> Option<Size<DevicePixels>> {
         width: DevicePixels(rect.right - rect.left),
         height: DevicePixels(rect.bottom - rect.top),
     })
-}
-
-fn present_count(renderer: &DirectXRenderer) -> Option<u32> {
-    let resources = renderer.resources.as_ref()?;
-    unsafe { resources.swap_chain.GetLastPresentCount() }.ok()
 }

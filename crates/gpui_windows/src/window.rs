@@ -748,8 +748,7 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
         let hwnd = self.0.hwnd;
-        // A plain move overrides a synced one still waiting for its frame.
-        self.state.pending_bounds.set(None);
+        crate::picell_synced_bounds::cancel(&self.0);
         let bounds = bounds.to_device_pixels(self.scale_factor());
         // The border offset lives outside the logical bounds, so position and size both come
         // from the adjusted rect -- passing `bounds.origin` here would shift the window by
@@ -776,14 +775,16 @@ impl PlatformWindow for WindowsWindow {
             .detach();
     }
 
-    fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) {
+    fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) -> bool {
         let rect = calculate_window_rect(
             bounds.to_device_pixels(self.scale_factor()),
             &self.state.border_offset,
         );
-        if !crate::picell_synced_bounds::request(&self.0, self.0.hwnd, bounds, rect) {
-            self.set_bounds(bounds);
+        if crate::picell_synced_bounds::request(&self.0, self.0.hwnd, bounds, rect) {
+            return true;
         }
+        self.set_bounds(bounds);
+        false
     }
 
     fn scale_factor(&self) -> f32 {

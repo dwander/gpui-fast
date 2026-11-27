@@ -256,7 +256,7 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    pub(crate) fn handle_size_change(
+    fn handle_size_change(
         &self,
         device_size: Size<DevicePixels>,
         scale_factor: f32,

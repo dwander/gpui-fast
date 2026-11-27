@@ -1324,6 +1324,7 @@ pub struct Window {
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     pub(crate) hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    pub(crate) synced_bounds: crate::fast::synced_bounds::SyncedBounds,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2093,7 +2094,8 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
-                                let arena_clear_needed = window.draw(cx);
+                                let arena_clear_needed =
+                                    crate::fast::synced_bounds::draw(window, cx);
                                 window.present();
                                 arena_clear_needed.clear(cx);
                             })
@@ -2463,6 +2465,7 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
             needs_present,
+            synced_bounds: crate::fast::synced_bounds::SyncedBounds::default(),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3251,6 +3254,7 @@ impl Window {
 
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
+        crate::fast::synced_bounds::cancel(self);
         self.platform_window.resize(size);
     }
 
@@ -3258,14 +3262,8 @@ impl Window {
     /// reports. Unlike [`Window::resize`] this can keep a window centered while its size
     /// follows its content. Backends that cannot move a window only resize it.
     pub fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        crate::fast::synced_bounds::cancel(self);
         self.platform_window.set_bounds(bounds);
-    }
-
-    /// [`Window::set_bounds`] that moves the window together with the first frame drawn at
-    /// the new size, instead of before it — for a window sized by its content, where the
-    /// gap between the two shows as a flash. See [`PlatformWindow::set_bounds_with_frame`].
-    pub fn set_bounds_with_frame(&mut self, bounds: Bounds<Pixels>) {
-        self.platform_window.set_bounds_with_frame(bounds);
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -4016,6 +4014,7 @@ impl Window {
         if self.focus != focus_before_listeners {
             self.refresh();
         }
+        crate::fast::synced_bounds::keep_frame_coming(self);
         self.needs_present.set(true);
 
         #[cfg(feature = "profiler")]

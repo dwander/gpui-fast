@@ -86,6 +86,7 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
 
     hdr: HdrOutput,
+    pub(crate) picell_synced_present: crate::picell_synced_bounds::SyncedPresent,
 }
 
 /// HDR (scRGB) output. Off until the app asks for it ([`DirectXRenderer::set_hdr_content`]) *and*
@@ -127,7 +128,7 @@ pub(crate) struct DirectXRendererDevices {
 
 pub(crate) struct DirectXResources {
     // Direct3D rendering objects
-    pub(crate) swap_chain: IDXGISwapChain1,
+    swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     pub(crate) render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -338,6 +339,7 @@ impl DirectXRenderer {
             fast_recovery: crate::fast::device_recovery::RecoveryState::default(),
             active_render_target: None,
             hdr: HdrOutput::default(),
+            picell_synced_present: Default::default(),
         };
         // [PiCell]
         crate::picell_clip_probe::apply(&mut renderer);
@@ -398,6 +400,7 @@ impl DirectXRenderer {
 
     #[inline]
     pub(crate) fn present(&mut self) -> Result<()> {
+        crate::picell_synced_bounds::before_present(self);
         let result = unsafe {
             self.resources
                 .as_ref()
